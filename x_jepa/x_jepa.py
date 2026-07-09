@@ -8,6 +8,8 @@ from torch.nn import Module, ModuleList, Linear
 from einops import einsum
 from einops.layers.torch import Rearrange
 
+from ema_pytorch import EMA
+
 # constants
 
 LinearNoBias = partial(Linear, bias = False)
