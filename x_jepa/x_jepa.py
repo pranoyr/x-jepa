@@ -33,12 +33,15 @@ class Attention(Module):
         dim,
         dim_head = 64,
         heads = 8,
-        causal = True
+        causal = True,
+        prenorm = True
     ):
         super().__init__()
         self.scale = dim_head ** -0.5
         dim_inner = dim_head * heads
         self.causal = causal
+
+        self.norm = nn.RMSNorm(dim) if prenorm else nn.Identity()
 
         self.to_q = LinearNoBias(dim, dim_inner)
         self.to_kv = LinearNoBias(dim, dim_inner * 2)
@@ -53,6 +56,8 @@ class Attention(Module):
         tokens # (b n d)
     ):
         device = tokens.device
+
+        tokens = self.norm(tokens)
 
         q, k, v = (self.to_q(tokens), *self.to_kv(tokens).chunk(2, dim = -1))
         q, k, v = (self.split_heads(t) for t in (q, k, v))
@@ -80,9 +85,14 @@ class SwiGLUGate(Module):
         x, gates = x.chunk(2, dim = -1)
         return F.silu(gates) * x
 
-def SwiGLUFeedForward(dim, expand_factor = 4.):
+def SwiGLUFeedForward(
+    dim,
+    expand_factor = 4.,
+    prenorm = True
+):
     dim_inner = int(dim * expand_factor * 2 / 3)
     return nn.Sequential(
+        nn.RMSNorm(dim) if prenorm else nn.Identity(),
         Linear(dim, dim_inner * 2),
         SwiGLUGate(),
         Linear(dim_inner, dim)
