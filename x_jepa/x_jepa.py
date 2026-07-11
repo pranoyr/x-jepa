@@ -199,7 +199,8 @@ class WorldModel(Module):
         pop_size = 1024,
         elite_frac = 0.1,
         generations = 5,
-        eps = 1e-5
+        eps = 1e-5,
+        clamp_state_latent_to_range = True
     ):
         device = self.device
 
@@ -259,6 +260,9 @@ class WorldModel(Module):
                 step_residual = self.ema_state_transition((step_state_latents, step_action_latents))
 
                 step_state_latents = step_state_latents + step_residual
+
+                if clamp_state_latent_to_range:
+                    step_state_latents.clamp_(-1., 1.)
 
                 pred_state_latents.append(step_state_latents)
 
