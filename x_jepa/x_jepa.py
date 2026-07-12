@@ -431,9 +431,11 @@ class WorldModel(Module):
 
         pred_next_encoded_state = self.to_next_encoded_state_pred((state_latents, action_latents))
 
-        next_encoded_state = self.ema_state_encoder(states)
+        ema_encoded_state = self.ema_state_encoder(states)
 
-        next_encoded_state_pred_loss = F.smooth_l1_loss(pred_next_encoded_state, next_encoded_state[:, 1:])
+        next_ema_encoded_state_target = ema_encoded_state[:, 1:]
+
+        next_encoded_state_pred_loss = F.smooth_l1_loss(pred_next_encoded_state, next_ema_encoded_state_target.detach())
 
         # losses
 
