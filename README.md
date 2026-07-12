@@ -48,3 +48,15 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
     url     = {https://openreview.net/forum?id=ZOtOq7hxJP}
 }
 ```
+
+```bibtex
+@misc{farebrother2026compositionalplanningjumpyworld,
+    title   = {Compositional Planning with Jumpy World Models},
+    author  = {Jesse Farebrother and Matteo Pirotta and Andrea Tirinzoni and Marc G. Bellemare and Alessandro Lazaric and Ahmed Touati},
+    year    = {2026},
+    eprint  = {2602.19634},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2602.19634},
+}
+```
