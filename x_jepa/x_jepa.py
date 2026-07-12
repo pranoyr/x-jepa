@@ -394,7 +394,8 @@ class WorldModel(Module):
     def forward(
         self,
         states,
-        actions
+        actions,
+        behavior_clone = True
     ):
         state_len, action_len = states.shape[1], actions.shape[1]
         assert action_len in {state_len, state_len - 1}
@@ -477,7 +478,7 @@ class WorldModel(Module):
 
         bc_loss = self.zero
 
-        if self.has_bc:
+        if self.has_bc and behavior_clone:
             bc_encoded_states = self.bc_state_encoder(cat((state_tokens[:, :-1], state_latents.detach()), dim = -1))
             bc_encoded_actions = self.bc_action_encoder(cat((action_tokens[:, :-1], action_latents.detach()), dim = -1))
 
