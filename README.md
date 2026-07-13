@@ -74,6 +74,18 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
 ```
 
 ```bibtex
+@misc{wu2026visreg,
+    title   = {VISReg: Variance-Invariance-Sketching Regularization for JEPA training},
+    author  = {Haiyu Wu and Randall Balestriero and Morgan Levine},
+    year    = {2026},
+    eprint  = {2606.02572},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2606.02572},
+}
+```
+
+```bibtex
 @misc{kimiteam2026attentionresiduals,
     title   = {Attention Residuals},
     author  = {Kimi Team and Guangyu Chen and Yu Zhang and Jianlin Su and Weixin Xu and Siyuan Pan and Yaoyu Wang and Yucheng Wang and Guanduo Chen and Bohong Yin and Yutian Chen and Junjie Yan and Ming Wei and Y. Zhang and Fanqing Meng and Chao Hong and Xiaotong Xie and Shaowei Liu and Enzhe Lu and Yunpeng Tai and Yanru Chen and Xin Men and Haiqing Guo and Y. Charles and Haoyu Lu and Lin Sui and Jinguo Zhu and Zaida Zhou and Weiran He and Weixiao Huang and Xinran Xu and Yuzhi Wang and Guokun Lai and Yulun Du and Yuxin Wu and Zhilin Yang and Xinyu Zhou},
