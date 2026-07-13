@@ -1,6 +1,7 @@
 from __future__ import annotations
-
 from typing import Callable, Literal
+
+import inspect
 from functools import partial
 
 import torch
@@ -172,7 +173,8 @@ class WorldModel(Module):
         action_eps = 1e-5,
         action_recon_loss_weight = 1.,
         next_encoded_state_pred_loss_weight = 1.,
-        bc_loss_weight = 1.
+        bc_loss_weight = 1.,
+        value_loss_weight = 1.
     ):
         super().__init__()
 
@@ -266,12 +268,16 @@ class WorldModel(Module):
         self.continuous_actions = continuous_actions
         self.action_eps = action_eps
 
+        # value head
+
+        self.value_head = MLP(dim_state_latent + dim, *((dim * 2,) * 2), 1)
+
         # loss related
 
         self.action_recon_loss_weight = action_recon_loss_weight
-
         self.next_encoded_state_pred_loss_weight = next_encoded_state_pred_loss_weight
         self.bc_loss_weight = bc_loss_weight
+        self.value_loss_weight = value_loss_weight
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
@@ -290,7 +296,7 @@ class WorldModel(Module):
         self,
         states,
         actions,
-        fitness_fn: Callable[[Tensor], Tensor] | None = None,
+        fitness_fn: Callable[..., Tensor] | None = None,
         goal_state: Tensor | None = None,
         goal_dist_fn: Callable[[Tensor, Tensor], Tensor] | None = None,
         horizon = 1,
@@ -307,7 +313,7 @@ class WorldModel(Module):
         state_len, action_len = states.shape[1], actions.shape[1]
         dim_action = self.dim_transition_action_input
 
-        assert exists(fitness_fn) ^ exists(goal_state)
+        assert exists(fitness_fn) or exists(goal_state), 'either fitness_fn or goal_state must be provided'
         assert action_len == (state_len - 1)
         assert generations > 0
         assert horizon >= 1
@@ -356,6 +362,7 @@ class WorldModel(Module):
 
             pred_state_latents = []
             pred_next_encoded_states = []
+            pred_values = []
 
             # step through the learnt world model
 
@@ -380,24 +387,43 @@ class WorldModel(Module):
 
                 pred_next_encoded_states.append(pred_next_encoded_state)
 
+                step_pred_value = self.value_head((pred_next_encoded_state, step_state_latents))
+                pred_values.append(step_pred_value)
+
             pred_state_latents = rearrange(pred_state_latents, 'h b p d -> b p h d')
 
             pred_next_encoded_states = rearrange(pred_next_encoded_states, 'h b p d -> b p h d')
+            pred_values = rearrange(pred_values, 'h b p 1 -> b p h')
 
             # evaluate
 
             if exists(goal_state):
                 encoded_goal = self.ema_state_encoder(goal_state)
                 encoded_goal = rearrange(encoded_goal, 'b d -> b 1 1 d')
+            else:
+                encoded_goal = None
 
+            if exists(fitness_fn):
+                # simple introspect and dependency inject into fitness function
+
+                fn_params = inspect.signature(fitness_fn).parameters
+                kwargs = dict()
+
+                if 'pred_state_latents' in fn_params:
+                    kwargs['pred_state_latents'] = pred_state_latents
+                if 'pred_next_encoded_states' in fn_params:
+                    kwargs['pred_next_encoded_states'] = pred_next_encoded_states
+                if 'pred_values' in fn_params:
+                    kwargs['pred_values'] = pred_values
+                if 'encoded_goal' in fn_params:
+                    kwargs['encoded_goal'] = encoded_goal
+
+                fitnesses = fitness_fn(**kwargs)
+            else:
                 goal_dist_fn = default(goal_dist_fn, partial(F.smooth_l1_loss, reduction = 'none'))
-
                 distance_to_goal = goal_dist_fn(pred_next_encoded_states, encoded_goal)
                 distance_to_goal = reduce(distance_to_goal, 'b p h d -> b p', 'sum')
-
                 fitnesses = -distance_to_goal
-            else:
-                fitnesses = fitness_fn(pred_state_latents) # (b p)
 
             # select the fittest
 
@@ -432,6 +458,7 @@ class WorldModel(Module):
         self,
         states,
         actions,
+        returns = None,
         behavior_clone = True
     ):
         state_len, action_len = states.shape[1], actions.shape[1]
@@ -565,15 +592,26 @@ class WorldModel(Module):
             else:
                 bc_loss = F.cross_entropy(rearrange(next_action_pred, 'b n c -> b c n'), next_actions)
 
+        # value head
+
+        value_loss = self.zero
+
+        pred_values = self.value_head((state_tokens[:, :-1], state_latents.detach()))
+        pred_values = rearrange(pred_values, '... 1 -> ...')
+
+        if exists(returns):
+            value_loss = F.mse_loss(pred_values, returns)
+
         # losses
 
         total_loss = (
             loss +
             action_recon_loss * self.action_recon_loss_weight +
             next_encoded_state_pred_loss * self.next_encoded_state_pred_loss_weight +
-            bc_loss * self.bc_loss_weight
+            bc_loss * self.bc_loss_weight +
+            value_loss * self.value_loss_weight
         )
 
-        loss_breakdown = (loss, action_recon_loss, next_encoded_state_pred_loss, bc_loss)
+        loss_breakdown = (loss, action_recon_loss, next_encoded_state_pred_loss, bc_loss, value_loss)
 
         return total_loss, loss_breakdown

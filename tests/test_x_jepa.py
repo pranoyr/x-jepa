@@ -7,10 +7,10 @@ from x_jepa.x_jepa import WorldModel, Transformer
 
 from einops import reduce
 
-@param('use_goal', (False, True))
+@param('plan_type', ('no_goal', 'goal', 'custom_goal'))
 @param('transition_action_space', ('raw', 'encoded', 'latent'))
 def test_world_model(
-    use_goal,
+    plan_type,
     transition_action_space
 ):
     model = Transformer(
@@ -19,10 +19,12 @@ def test_world_model(
         causal = True
     )
 
+    transition_action_is_raw = transition_action_space == 'raw'
+
     world_model = WorldModel(
         state_encoder = nn.Linear(128, 512),
         action_encoder = nn.Linear(20, 512),
-        action_decoder = nn.Linear(32, 20) if transition_action_space != 'raw' else None,
+        action_decoder = nn.Linear(32, 20) if not transition_action_is_raw else None,
         transition_action_space = transition_action_space,
         dim_action = 20,
         dim_action_latent = 32,
@@ -31,9 +33,11 @@ def test_world_model(
 
     states = torch.randn(2, 10, 128)
     actions = torch.randn(2, 9, 20).tanh()
+    returns = torch.randn(2, 9)
 
-    loss, _ = world_model(states, actions)
+    loss, loss_breakdown = world_model(states, actions, returns = returns)
 
+    assert len(loss_breakdown) == 5
     assert loss.ndim == 0
     loss.backward()
 
@@ -43,9 +47,21 @@ def test_world_model(
 
     # planning
 
-    if use_goal:
+    if plan_type == 'goal':
         goal_state = torch.randn(2, 128)
         plan_kwargs = dict(goal_state = goal_state)
+
+    elif plan_type == 'custom_goal':
+        goal_state = torch.randn(2, 128)
+
+        def custom_fitness_fn(pred_values, pred_next_encoded_states, encoded_goal):
+            dist = torch.nn.functional.mse_loss(pred_next_encoded_states, encoded_goal, reduction='none')
+            dist = reduce(dist, 'b p h d -> b p', 'sum')
+            values = reduce(pred_values, 'b p h -> b p', 'sum')
+            return values - dist
+
+        plan_kwargs = dict(goal_state = goal_state, fitness_fn = custom_fitness_fn)
+
     else:
         fitness_fn = lambda pred_state_latents: reduce(pred_state_latents, 'b p ... -> b p', 'sum')
         plan_kwargs = dict(fitness_fn = fitness_fn)
