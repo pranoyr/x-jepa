@@ -38,9 +38,9 @@ Losses = namedtuple('Losses', [
     'next_encoded_state_pred',
     'bc',
     'value',
-    'sigreg_next_state',
-    'sigreg_next_encoded',
-    'sigreg_action',
+    'reg_next_state',
+    'reg_next_encoded',
+    'reg_action',
     'action_wasserstein'
 ])
 
@@ -57,6 +57,9 @@ def xnor(x, y):
 
 def identity(t):
     return t
+
+def is_empty(t):
+    return len(t) == 0
 
 # helper modules
 
@@ -259,12 +262,12 @@ class WorldModel(Module):
         bc_loss_weight = 1.,
         value_loss_weight = 1.,
         frac_gradients = 0.,
-        sigreg_next_state_weight = 0.,
-        sigreg_next_encoded_weight = 0.,
-        sigreg_action_weight = 0.,
+        reg_next_state_weight = 0.,
+        reg_next_encoded_weight = 0.,
+        reg_action_weight = 0.,
         action_latent_wasserstein_loss_weight = 0.,
-        sigreg: Module | None = None,
-        sigreg_loss_kwargs: dict | None = None
+        reg: Module | None = None,
+        reg_loss_kwargs: dict | None = None
     ):
         super().__init__()
 
@@ -374,13 +377,13 @@ class WorldModel(Module):
         self.bc_loss_weight = bc_loss_weight
         self.value_loss_weight = value_loss_weight
 
-        # sigreg
+        # regularizer - defaults to sigreg, but any drop-in (ex. visreg) can be passed in
 
-        self.sigreg = default(sigreg, SigReg(**default(sigreg_loss_kwargs, dict())))
+        self.reg = default(reg, SigReg(**default(reg_loss_kwargs, dict())))
 
-        self.sigreg_next_state_weight = sigreg_next_state_weight
-        self.sigreg_next_encoded_weight = sigreg_next_encoded_weight
-        self.sigreg_action_weight = sigreg_action_weight
+        self.reg_next_state_weight = reg_next_state_weight
+        self.reg_next_encoded_weight = reg_next_encoded_weight
+        self.reg_action_weight = reg_action_weight
 
         self.action_latent_wasserstein_loss_weight = action_latent_wasserstein_loss_weight
 
@@ -462,6 +465,7 @@ class WorldModel(Module):
             # instantiate population
 
             # actions could be in raw, encoded, or contextualized latent space
+
             actions = means + stds * torch.randn((batch, pop_size, horizon, dim_action), device = device)
             actions.clamp_(-1., 1.)
 
@@ -523,6 +527,10 @@ class WorldModel(Module):
                 if 'encoded_goal' in fn_params:
                     kwargs['encoded_goal'] = encoded_goal
 
+                allowed_params = {'pred_state_latents', 'pred_next_encoded_states', 'pred_values', 'encoded_goal'}
+                unknown_params = set(fn_params.keys()) - allowed_params
+                assert is_empty(unknown_params), f"fitness_fn accepts unknown parameters: {unknown_params}. Allowed parameters are: {', '.join(allowed_params)}"
+
                 fitnesses = fitness_fn(**kwargs)
             else:
                 goal_dist_fn = default(goal_dist_fn, partial(F.smooth_l1_loss, reduction = 'none'))
@@ -551,6 +559,9 @@ class WorldModel(Module):
         winning_actions = fittest_actions[:, 0]
 
         decoded_actions = self.action_decoder(winning_actions)
+
+        if not self.continuous_actions:
+            decoded_actions = decoded_actions.argmax(dim = -1)
 
         # return
 
@@ -681,8 +692,7 @@ class WorldModel(Module):
 
             # log probs
 
-            next_actions = orig_actions[:, 1:]
-            next_action_pred = next_action_pred[:, :next_actions.shape[1]]
+            next_actions = orig_actions[:, :next_action_pred.shape[1]]
 
             if self.continuous_actions:
                 # use unimodal beta
@@ -713,20 +723,20 @@ class WorldModel(Module):
         if exists(returns):
             value_loss = F.mse_loss(pred_values, returns)
 
-        # sigreg loss
+        # regularizer loss
 
-        sigreg_next_state_loss = self.zero
-        sigreg_next_encoded_loss = self.zero
-        sigreg_action_loss = self.zero
+        reg_next_state_loss = self.zero
+        reg_next_encoded_loss = self.zero
+        reg_action_loss = self.zero
 
-        if self.sigreg_next_state_weight > 0.:
-            sigreg_next_state_loss = self.sigreg(next_state_pred)
+        if self.reg_next_state_weight > 0.:
+            reg_next_state_loss = self.reg(next_state_pred)
 
-        if self.sigreg_next_encoded_weight > 0.:
-            sigreg_next_encoded_loss = self.sigreg(pred_next_encoded_state)
+        if self.reg_next_encoded_weight > 0.:
+            reg_next_encoded_loss = self.reg(pred_next_encoded_state)
 
-        if self.sigreg_action_weight > 0.:
-            sigreg_action_loss = self.sigreg(action_cond)
+        if self.reg_action_weight > 0.:
+            reg_action_loss = self.reg(action_cond)
 
         # action latent uniform loss
 
@@ -743,9 +753,9 @@ class WorldModel(Module):
             next_encoded_state_pred_loss * self.next_encoded_state_pred_loss_weight +
             bc_loss * self.bc_loss_weight +
             value_loss * self.value_loss_weight +
-            sigreg_next_state_loss * self.sigreg_next_state_weight +
-            sigreg_next_encoded_loss * self.sigreg_next_encoded_weight +
-            sigreg_action_loss * self.sigreg_action_weight +
+            reg_next_state_loss * self.reg_next_state_weight +
+            reg_next_encoded_loss * self.reg_next_encoded_weight +
+            reg_action_loss * self.reg_action_weight +
             action_wasserstein_loss * self.action_latent_wasserstein_loss_weight
         )
 
@@ -755,9 +765,9 @@ class WorldModel(Module):
             next_encoded_state_pred_loss,
             bc_loss,
             value_loss,
-            sigreg_next_state_loss,
-            sigreg_next_encoded_loss,
-            sigreg_action_loss,
+            reg_next_state_loss,
+            reg_next_encoded_loss,
+            reg_action_loss,
             action_wasserstein_loss
         )
 

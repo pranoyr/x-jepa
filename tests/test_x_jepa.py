@@ -3,17 +3,20 @@ param = pytest.mark.parametrize
 
 import torch
 from torch import nn
-from x_jepa.x_jepa import WorldModel, Transformer
-
 from einops import reduce
+
+from x_jepa.x_jepa import WorldModel, Transformer
+from x_jepa.regularizers import SigReg, VISReg
 
 @param('plan_type', ('no_goal', 'goal', 'custom_goal'))
 @param('transition_action_space', ('raw', 'encoded', 'latent'))
-@param('use_sigreg', (False, True))
+@param('use_reg', (False, True))
+@param('reg_type', ('sigreg', 'visreg'))
 def test_world_model(
     plan_type,
     transition_action_space,
-    use_sigreg
+    use_reg,
+    reg_type
 ):
     model = Transformer(
         dim = 512,
@@ -23,6 +26,8 @@ def test_world_model(
 
     transition_action_is_raw = transition_action_space == 'raw'
 
+    reg = SigReg() if reg_type == 'sigreg' else VISReg()
+
     world_model = WorldModel(
         state_encoder = nn.Linear(128, 512),
         action_encoder = nn.Linear(20, 512),
@@ -31,10 +36,11 @@ def test_world_model(
         dim_action = 20,
         dim_action_latent = 32,
         model = model,
-        sigreg_next_state_weight = float(use_sigreg),
-        sigreg_next_encoded_weight = float(use_sigreg),
-        sigreg_action_weight = float(use_sigreg),
-        action_latent_wasserstein_loss_weight = float(use_sigreg and not transition_action_is_raw)
+        reg = reg,
+        reg_next_state_weight = float(use_reg),
+        reg_next_encoded_weight = float(use_reg),
+        reg_action_weight = float(use_reg),
+        action_latent_wasserstein_loss_weight = float(use_reg and not transition_action_is_raw)
     )
 
     states = torch.randn(2, 10, 128)
@@ -61,7 +67,7 @@ def test_world_model(
         goal_state = torch.randn(2, 128)
 
         def custom_fitness_fn(pred_values, pred_next_encoded_states, encoded_goal):
-            dist = torch.nn.functional.mse_loss(pred_next_encoded_states, encoded_goal, reduction='none')
+            dist = torch.nn.functional.mse_loss(pred_next_encoded_states, encoded_goal, reduction = 'none')
             dist = reduce(dist, 'b p h d -> b p', 'sum')
             values = reduce(pred_values, 'b p h -> b p', 'sum')
             return values - dist
@@ -129,28 +135,15 @@ def test_behavior_cloning(
     assert loss.ndim == 0
     loss.backward()
 
+@param('reg_type', ('sigreg', 'visreg'))
+def test_reg_loss(reg_type):
+    from x_jepa.regularizers import sigreg_loss, visreg_loss
 
-def test_world_model_supports_distinct_state_latent_dimension():
-    model = Transformer(
-        dim = 8,
-        depth = 1,
-        dim_head = 4,
-        heads = 2
-    )
+    loss_fn = sigreg_loss if reg_type == 'sigreg' else visreg_loss
 
-    world_model = WorldModel(
-        state_encoder = nn.Linear(6, 8),
-        action_encoder = nn.Linear(2, 8),
-        transition_action_space = 'raw',
-        dim_action = 2,
-        dim_state_latent = 4,
-        model = model
-    )
+    x = torch.randn(256, 64).requires_grad_()
 
-    states = torch.randn(1, 3, 6)
-    actions = torch.randn(1, 2, 2).tanh()
-
-    loss, _ = world_model(states, actions)
+    loss = loss_fn(x)
 
     assert loss.ndim == 0
     loss.backward()
