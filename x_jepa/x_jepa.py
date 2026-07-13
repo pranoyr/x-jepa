@@ -40,7 +40,6 @@ Losses = namedtuple('Losses', [
     'value',
     'reg_next_state',
     'reg_next_encoded',
-    'reg_action',
     'action_wasserstein'
 ])
 
@@ -264,7 +263,6 @@ class WorldModel(Module):
         frac_gradients = 0.,
         reg_next_state_weight = 0.,
         reg_next_encoded_weight = 0.,
-        reg_action_weight = 0.,
         action_latent_wasserstein_loss_weight = 0.,
         reg: Module | None = None,
         reg_loss_kwargs: dict | None = None
@@ -383,7 +381,6 @@ class WorldModel(Module):
 
         self.reg_next_state_weight = reg_next_state_weight
         self.reg_next_encoded_weight = reg_next_encoded_weight
-        self.reg_action_weight = reg_action_weight
 
         self.action_latent_wasserstein_loss_weight = action_latent_wasserstein_loss_weight
 
@@ -450,8 +447,6 @@ class WorldModel(Module):
         num_elites = int(elite_frac * pop_size)
         assert num_elites >= 1
 
-        dim_latent = state_latents.shape[-1]
-
         shape = (batch, 1, horizon, dim_action)
 
         means = torch.rand(shape, device = device) * 2. - 1.
@@ -516,22 +511,20 @@ class WorldModel(Module):
                 # simple introspect and dependency inject into fitness function
 
                 fn_params = inspect.signature(fitness_fn).parameters
-                kwargs = dict()
 
-                if 'pred_state_latents' in fn_params:
-                    kwargs['pred_state_latents'] = pred_state_latents
-                if 'pred_next_encoded_states' in fn_params:
-                    kwargs['pred_next_encoded_states'] = pred_next_encoded_states
-                if 'pred_values' in fn_params:
-                    kwargs['pred_values'] = pred_values
-                if 'encoded_goal' in fn_params:
-                    kwargs['encoded_goal'] = encoded_goal
+                kwargs = dict(
+                    pred_state_latents = pred_state_latents,
+                    pred_next_encoded_states = pred_next_encoded_states,
+                    pred_values = pred_values,
+                    encoded_goal = encoded_goal
+                )
 
-                allowed_params = {'pred_state_latents', 'pred_next_encoded_states', 'pred_values', 'encoded_goal'}
+                allowed_params = set(kwargs.keys())
                 unknown_params = set(fn_params.keys()) - allowed_params
                 assert is_empty(unknown_params), f"fitness_fn accepts unknown parameters: {unknown_params}. Allowed parameters are: {', '.join(allowed_params)}"
 
-                fitnesses = fitness_fn(**kwargs)
+                fitness_fn_kwargs = {k: v for k, v in kwargs.items() if k in fn_params}
+                fitnesses = fitness_fn(**fitness_fn_kwargs)
             else:
                 goal_dist_fn = default(goal_dist_fn, partial(F.smooth_l1_loss, reduction = 'none'))
                 distance_to_goal = goal_dist_fn(pred_next_encoded_states, encoded_goal)
@@ -727,16 +720,12 @@ class WorldModel(Module):
 
         reg_next_state_loss = self.zero
         reg_next_encoded_loss = self.zero
-        reg_action_loss = self.zero
 
         if self.reg_next_state_weight > 0.:
             reg_next_state_loss = self.reg(next_state_pred)
 
         if self.reg_next_encoded_weight > 0.:
             reg_next_encoded_loss = self.reg(pred_next_encoded_state)
-
-        if self.reg_action_weight > 0.:
-            reg_action_loss = self.reg(action_cond)
 
         # action latent uniform loss
 
@@ -755,7 +744,6 @@ class WorldModel(Module):
             value_loss * self.value_loss_weight +
             reg_next_state_loss * self.reg_next_state_weight +
             reg_next_encoded_loss * self.reg_next_encoded_weight +
-            reg_action_loss * self.reg_action_weight +
             action_wasserstein_loss * self.action_latent_wasserstein_loss_weight
         )
 
@@ -767,7 +755,6 @@ class WorldModel(Module):
             value_loss,
             reg_next_state_loss,
             reg_next_encoded_loss,
-            reg_action_loss,
             action_wasserstein_loss
         )
 

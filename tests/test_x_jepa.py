@@ -39,7 +39,6 @@ def test_world_model(
         reg = reg,
         reg_next_state_weight = float(use_reg),
         reg_next_encoded_weight = float(use_reg),
-        reg_action_weight = float(use_reg),
         action_latent_wasserstein_loss_weight = float(use_reg and not transition_action_is_raw)
     )
 
@@ -49,7 +48,7 @@ def test_world_model(
 
     loss, loss_breakdown = world_model(states, actions, returns = returns)
 
-    assert len(loss_breakdown) == 9
+    assert len(loss_breakdown) == 8
     assert loss.ndim == 0
     loss.backward()
 
