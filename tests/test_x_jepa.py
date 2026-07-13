@@ -128,3 +128,29 @@ def test_behavior_cloning(
 
     assert loss.ndim == 0
     loss.backward()
+
+
+def test_world_model_supports_distinct_state_latent_dimension():
+    model = Transformer(
+        dim = 8,
+        depth = 1,
+        dim_head = 4,
+        heads = 2
+    )
+
+    world_model = WorldModel(
+        state_encoder = nn.Linear(6, 8),
+        action_encoder = nn.Linear(2, 8),
+        transition_action_space = 'raw',
+        dim_action = 2,
+        dim_state_latent = 4,
+        model = model
+    )
+
+    states = torch.randn(1, 3, 6)
+    actions = torch.randn(1, 2, 2).tanh()
+
+    loss, _ = world_model(states, actions)
+
+    assert loss.ndim == 0
+    loss.backward()
