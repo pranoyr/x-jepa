@@ -11,7 +11,7 @@ from x_jepa.x_jepa import WorldModel, Transformer
 from x_jepa.regularizers import SigReg, VISReg, uniform_wasserstein_loss
 
 @param('plan_type', ('no_goal', 'goal', 'custom_goal'))
-@param('transition_action_space', ('raw', 'encoded', 'latent'))
+@param('transition_action_space', ('raw', 'local', 'global'))
 @param('use_reg', (False, True))
 @param('reg_type', ('sigreg', 'visreg'))
 def test_world_model(
@@ -50,7 +50,7 @@ def test_world_model(
 
     loss, loss_breakdown = world_model(states, actions, returns = returns)
 
-    assert len(loss_breakdown) == 8
+    assert len(loss_breakdown) == 9
     assert loss.ndim == 0
     loss.backward()
 
@@ -83,16 +83,16 @@ def test_world_model(
 
     assert planned_actions.shape == (2, 5, 20)
 
-@param('transition_action_space', ('raw', 'encoded', 'latent'))
-@param('search_space', ('raw', 'encoded_latent', None))
+@param('transition_action_space', ('raw', 'local', 'global'))
+@param('search_space', ('raw', 'local_global', None))
 def test_plan_search_spaces(
     transition_action_space,
     search_space
 ):
-    if transition_action_space == 'raw' and search_space == 'encoded_latent':
+    if transition_action_space == 'raw' and search_space == 'local_global':
         pytest.skip('raw transition action space requires raw search space')
 
-    if transition_action_space == 'latent' and search_space == 'raw':
+    if transition_action_space == 'global' and search_space == 'raw':
         pytest.skip('latent transition action space can only be searched in encoded_latent space for now')
 
     model = Transformer(
@@ -128,7 +128,7 @@ def test_plan_search_spaces(
 
 @param('continuous_actions', (True, False))
 @param('action_len', (9, 10))
-@param('transition_action_space', ('raw', 'encoded', 'latent'))
+@param('transition_action_space', ('raw', 'local', 'global'))
 @param('pass_world_model_hiddens_to_actor', (True, False))
 def test_behavior_cloning(
     continuous_actions,
@@ -196,3 +196,35 @@ def test_reg_loss(reg_type):
 def test_uniform_wasserstein_uses_bin_midpoints(samples):
     loss = uniform_wasserstein_loss(samples)
     assert_close(loss, torch.tensor(0.))
+
+def test_linear_rnn_parallel_matches_sequential():
+    from x_jepa.min_gru import minGRUBlocks
+
+    batch_size = 2
+    seq_len = 10
+    dim = 32
+
+    model = minGRUBlocks(dim = dim, depth = 2)
+
+    x = torch.randn(batch_size, seq_len, dim)
+
+    # get parallel
+
+    out = model(x)
+    assert out.shape == x.shape
+
+    # get sequential
+
+    out_seqs = []
+
+    kwargs = {}
+    for i in range(seq_len):
+        x_i = x[:, i:i+1, :]
+        out_i, memories = model(x_i, return_memories = True, **kwargs)
+
+        out_seqs.append(out_i)
+        kwargs.update(memories = memories)
+
+    out_seq = torch.cat(out_seqs, dim = 1)
+
+    assert torch.allclose(out, out_seq, atol = 1e-5)

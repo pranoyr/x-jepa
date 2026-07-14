@@ -26,7 +26,8 @@ from torch_einops_utils import (
     pack_with_inverse
 )
 
-from x_jepa.regularizers import sigreg_loss, SigReg, uniform_wasserstein_loss
+from x_jepa.regularizers import SigReg, uniform_wasserstein_loss
+from x_jepa.min_gru import minGRUBlocks
 
 # constants
 
@@ -34,6 +35,7 @@ LinearNoBias = partial(Linear, bias = False)
 
 Losses = namedtuple('Losses', [
     'next_state_latent_pred',
+    'plan_state_pred',
     'action_recon',
     'next_encoded_state_pred',
     'bc',
@@ -59,6 +61,9 @@ def identity(t):
 
 def is_empty(t):
     return len(t) == 0
+
+def batch_repeat(t, r):
+    return repeat(t, 'b ... -> (b r) ...', r = r)
 
 # helper modules
 
@@ -258,7 +263,8 @@ class WorldModel(Module):
         model: Module,
         action_decoder: Module | None = None,
         state_transition: Module | None = None,
-        transition_action_space: Literal['raw', 'encoded', 'latent'] = 'raw',
+        state_transition_for_planning: Module | None = None,
+        transition_action_space: Literal['raw', 'local', 'global'] = 'raw',
         dim_action_latent = None,
         dim_state_latent = None,
         state_latent_clamp_value = 10.,
@@ -270,6 +276,7 @@ class WorldModel(Module):
         action_eps = 1e-5,
         action_recon_loss_weight = 1.,
         next_encoded_state_pred_loss_weight = 1.,
+        plan_state_pred_loss_weight = 1.,
         bc_loss_weight = 1.,
         value_loss_weight = 1.,
         frac_gradients = 0.,
@@ -277,7 +284,9 @@ class WorldModel(Module):
         reg_next_encoded_weight = 0.,
         action_latent_wasserstein_loss_weight = 0.,
         reg: Module | None = None,
-        reg_loss_kwargs: dict | None = None
+        reg_loss_kwargs: dict | None = None,
+        state_linear_rnn_depth = 1,
+        action_linear_rnn_depth = 1
     ):
         super().__init__()
 
@@ -299,6 +308,9 @@ class WorldModel(Module):
 
         self.action_encoder = action_encoder
 
+        self.state_linear_rnn = minGRUBlocks(dim = dim, depth = state_linear_rnn_depth)
+        self.action_linear_rnn = minGRUBlocks(dim = dim, depth = action_linear_rnn_depth)
+
         # the learnt state transition that is popularly used for learning the so called world model, but may not be the only prediction needed
 
         # different types of action spaces for the transition
@@ -309,11 +321,11 @@ class WorldModel(Module):
             dim_transition_action_input = dim_action
             need_learned_action_decoder = False
 
-        elif transition_action_space == 'encoded':  # encoded, but uncontextualized
+        elif transition_action_space == 'local':  # encoded, but no context
             dim_transition_action_input = dim_action_latent
             need_learned_action_decoder = True
 
-        elif transition_action_space == 'latent': # the contextualized action
+        elif transition_action_space == 'global': # sees past actions
             dim_transition_action_input = dim_action_latent
             need_learned_action_decoder = True
 
@@ -321,24 +333,32 @@ class WorldModel(Module):
             raise ValueError('unknown state transition action space')
 
         self.transition_action_space = transition_action_space
-        self.has_action_latents = transition_action_space != 'raw'
+        self.is_transition_action_space_raw = transition_action_space == 'raw'
+        self.has_action_latents = not self.is_transition_action_space_raw
 
         assert not (not self.has_action_latents and action_latent_wasserstein_loss_weight > 0.), 'uniform wasserstein loss on action latents can only be used if there are action latents'
 
         assert xnor(need_learned_action_decoder, exists(action_decoder)), 'you need to pass in the action_decoder'
 
-        if not exists(state_transition):
-            # following Teoh, learn the residual with a 3 layer mlp
+        # following Teoh, learn the residual with a 3 layer mlp, for both state transition functions, one for main forward dynamics, the other for planning
 
+        if not exists(state_transition):
             state_transition = MLP(dim_state_latent + dim_transition_action_input, *((dim * 2,) * 2), dim_state_latent)
 
+        if not exists(state_transition_for_planning):
+            state_transition_for_planning = MLP(dim_state_latent + dim_transition_action_input, *((dim * 2,) * 2), dim_state_latent)
+
         self.dim_transition_action_input = dim_transition_action_input
+
         self.state_transition = state_transition
+        self.state_transition_for_planning = state_transition_for_planning
+
+        # maybe action decoding
 
         self.action_decoder = default(action_decoder, nn.Identity())
         self.need_learned_action_decoder = need_learned_action_decoder
 
-        # main world model
+        # main world model transformer
 
         self.model = model
 
@@ -358,6 +378,7 @@ class WorldModel(Module):
         self.ema_state_encoder = EMA(state_encoder, beta = ema_beta)
 
         self.ema_state_transition = EMA(state_transition, beta = ema_beta)
+        self.ema_state_transition_for_planning = EMA(self.state_transition_for_planning, beta = ema_beta)
 
         # actor / behavior clone
 
@@ -385,8 +406,10 @@ class WorldModel(Module):
 
         # loss related
 
-        self.action_recon_loss_weight = action_recon_loss_weight
         self.next_encoded_state_pred_loss_weight = next_encoded_state_pred_loss_weight
+        self.plan_state_pred_loss_weight = plan_state_pred_loss_weight
+
+        self.action_recon_loss_weight = action_recon_loss_weight
         self.bc_loss_weight = bc_loss_weight
         self.value_loss_weight = value_loss_weight
 
@@ -409,6 +432,7 @@ class WorldModel(Module):
         self.ema_state_encoder.update()
         self.ema_model.update()
         self.ema_state_transition.update()
+        self.ema_state_transition_for_planning.update()
 
     @torch.no_grad()
     @temp_eval
@@ -426,20 +450,20 @@ class WorldModel(Module):
         eps = 1e-5,
         clamp_state_latent_to_range = True,
         return_action_latent = False,
-        search_space: Literal['raw', 'encoded_latent'] | None = None
+        search_space: Literal['raw', 'local_global'] | None = None
     ):
         batch, device = states.shape[0], self.device
         state_len, action_len = states.shape[1], actions.shape[1]
 
         # search space and some validation while it is still incomplete
 
-        can_search_raw_actions = self.continuous_actions and self.transition_action_space != 'latent' and exists(self.dim_action)
-        search_space = default(search_space, 'raw' if can_search_raw_actions else 'encoded_latent')
+        can_search_raw_actions = self.continuous_actions and self.transition_action_space != 'global' and exists(self.dim_action)
+        search_space = default(search_space, 'raw' if can_search_raw_actions else 'local_global')
 
-        if self.transition_action_space == 'raw':
+        if self.is_transition_action_space_raw:
             assert search_space == 'raw'
-        elif self.transition_action_space == 'latent':
-            assert search_space == 'encoded_latent'
+        elif self.transition_action_space == 'global':
+            assert search_space == 'local_global'
         elif search_space == 'raw':
             assert self.continuous_actions and exists(self.dim_action), 'searching in raw action space requires continuous actions and `dim_action` to be set'
 
@@ -460,7 +484,13 @@ class WorldModel(Module):
         state_tokens = self.state_encoder(states)
         action_tokens = self.action_encoder(actions)
 
-        tokens = rearrange([state_tokens, action_tokens], 'sa b n d -> b (n sa) d')
+        # linear rnns for contextualizing states and actions separately
+
+        rnn_state_tokens = self.state_linear_rnn(state_tokens)
+
+        rnn_action_tokens, past_action_rnn_memories = self.action_linear_rnn(action_tokens, return_memories = True)
+
+        tokens = rearrange([rnn_state_tokens, rnn_action_tokens], 'sa b n d -> b (n sa) d')
 
         embeds = self.ema_model(tokens)
 
@@ -481,6 +511,10 @@ class WorldModel(Module):
         means = torch.rand(shape, device = device) * 2. - 1.
         stds = torch.rand(shape, device = device)
 
+        # precompute past rnn memories for rnn action latents, repeating to population size
+
+        past_rnn_memories = tree_map_tensor(partial(batch_repeat, r = pop_size), past_action_rnn_memories)
+
         # iterate
 
         for generation in range(generations):
@@ -495,12 +529,20 @@ class WorldModel(Module):
 
             # the action condition into the step
 
+            # the state transition for planning could take raw actions or action latents depending on the transition action space
+
             actions_cond = actions
 
-            if is_search_space_raw_action and self.transition_action_space == 'encoded':
+            if is_search_space_raw_action and not self.is_transition_action_space_raw:
                 actions_cond, unpack = pack_with_inverse(actions_cond, '* h d')
 
                 actions_cond = self.action_encoder(actions_cond)
+
+                # if using actions with global context of past actions, pass through linear rnn with previous memories
+
+                if self.transition_action_space == 'global':
+                    actions_cond = self.action_linear_rnn(actions_cond, memories = past_rnn_memories)
+
                 actions_cond = self.to_action_latent(actions_cond)
 
                 actions_cond = unpack(actions_cond)
@@ -523,9 +565,9 @@ class WorldModel(Module):
 
                 # state transition
 
-                step_residual = self.ema_state_transition((step_state_latents, step_action_cond))
+                pred_next_state_latent_residual = self.ema_state_transition_for_planning((step_state_latents, step_action_cond))
 
-                step_state_latents = step_state_latents + step_residual
+                step_state_latents = step_state_latents + pred_next_state_latent_residual
 
                 if clamp_state_latent_to_range and exists(self.state_latent_clamp_value) and self.state_latent_clamp_value > 0.:
                     step_state_latents.clamp_(-self.state_latent_clamp_value, self.state_latent_clamp_value)
@@ -544,11 +586,11 @@ class WorldModel(Module):
 
             # evaluate
 
+            encoded_goal = None
+
             if exists(goal_state):
                 encoded_goal = self.ema_state_encoder(goal_state)
                 encoded_goal = rearrange(encoded_goal, 'b d -> b 1 1 d')
-            else:
-                encoded_goal = None
 
             if exists(fitness_fn):
                 # simple introspect and dependency inject into fitness function
@@ -630,9 +672,14 @@ class WorldModel(Module):
         state_tokens = self.state_encoder(states)
         action_tokens = self.action_encoder(actions)
 
+        # linear rnns for contextualizing states and actions separately
+
+        rnn_state_tokens = self.state_linear_rnn(state_tokens)
+        rnn_action_tokens = self.action_linear_rnn(action_tokens)
+
         # now we interleave the states and actions
 
-        tokens = rearrange([state_tokens, action_tokens], 'sa b n d -> b (n sa) d')
+        tokens = rearrange([rnn_state_tokens, rnn_action_tokens], 'sa b n d -> b (n sa) d')
 
         # attention + eventually rnns - yes we need recurrence, i concede that.
 
@@ -661,11 +708,11 @@ class WorldModel(Module):
         if self.transition_action_space == 'raw':
             action_cond = orig_actions
 
-        elif self.transition_action_space == 'encoded':
+        elif self.transition_action_space == 'local':
             action_cond = self.to_action_latent(action_tokens)
 
-        elif self.transition_action_space == 'latent':
-            action_cond = self.to_action_latent(action_embeds)
+        elif self.transition_action_space == 'global':
+            action_cond = self.to_action_latent(rnn_action_tokens)
 
         action_cond = action_cond[:, :state_latents.shape[1]]
 
@@ -675,7 +722,15 @@ class WorldModel(Module):
 
         next_state_pred = state_latents + pred_residual
 
-        loss = F.smooth_l1_loss(next_state_pred, next_target_state_latents.detach())
+        next_state_latent_pred_loss = F.smooth_l1_loss(next_state_pred, next_target_state_latents.detach())
+
+        # prediction for planning transition, where actions can be in raw, local encoded, or global encoded
+
+        pred_residual_for_planning = self.state_transition_for_planning((state_latents, action_cond))
+
+        next_state_pred_for_plan = state_latents + pred_residual_for_planning
+
+        plan_state_pred_loss = F.smooth_l1_loss(next_state_pred_for_plan, next_target_state_latents.detach())
 
         # action decoder
 
@@ -783,7 +838,8 @@ class WorldModel(Module):
         # losses
 
         total_loss = (
-            loss +
+            next_state_latent_pred_loss +
+            plan_state_pred_loss * self.plan_state_pred_loss_weight +
             action_recon_loss * self.action_recon_loss_weight +
             next_encoded_state_pred_loss * self.next_encoded_state_pred_loss_weight +
             bc_loss * self.bc_loss_weight +
@@ -794,7 +850,8 @@ class WorldModel(Module):
         )
 
         loss_breakdown = Losses(
-            loss,
+            next_state_latent_pred_loss,
+            plan_state_pred_loss,
             action_recon_loss,
             next_encoded_state_pred_loss,
             bc_loss,
