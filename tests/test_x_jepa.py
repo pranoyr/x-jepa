@@ -2,11 +2,11 @@ import pytest
 param = pytest.mark.parametrize
 
 import torch
-from torch import nn
+from torch import nn, tensor
 from einops import reduce
 
 from x_jepa.x_jepa import WorldModel, Transformer
-from x_jepa.regularizers import SigReg, VISReg
+from x_jepa.regularizers import SigReg, VISReg, uniform_wasserstein_loss
 
 @param('plan_type', ('no_goal', 'goal', 'custom_goal'))
 @param('transition_action_space', ('raw', 'encoded', 'latent'))
@@ -177,3 +177,9 @@ def test_reg_loss(reg_type):
 
     assert loss.ndim == 0
     loss.backward()
+
+@pytest.mark.parametrize('samples', (tensor([[0.]]), tensor([[-0.5], [0.5]])))
+def test_uniform_wasserstein_uses_bin_midpoints(samples):
+    loss = uniform_wasserstein_loss(samples)
+
+    torch.testing.assert_close(loss, torch.tensor(0.))

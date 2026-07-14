@@ -74,6 +74,17 @@ class FracGradient(Module):
     def forward(self, x):
         return x.detach().lerp(x, self.frac)
 
+class SoftClamp(Module):
+    def __init__(self, value = 10.):
+        super().__init__()
+        self.value = value
+        self.has_value = exists(value) and value > 0.
+
+    def forward(self, x):
+        if not self.has_value:
+            return x
+        return (x / self.value).tanh() * self.value
+
 # attention
 
 class Attention(Module):
@@ -250,6 +261,7 @@ class WorldModel(Module):
         transition_action_space: Literal['raw', 'encoded', 'latent'] = 'raw',
         dim_action_latent = None,
         dim_state_latent = None,
+        state_latent_clamp_value = 10.,
         ema_beta = 0.95,
         bc_model: Module | None = None,
         pass_world_model_hiddens_to_actor = True,
@@ -277,6 +289,7 @@ class WorldModel(Module):
 
         self.dim_state_latent = dim_state_latent
         self.dim_action_latent = dim_action_latent
+        self.state_latent_clamp_value = state_latent_clamp_value
 
         # state and action encoder / decoder
 
@@ -333,7 +346,7 @@ class WorldModel(Module):
 
         # projection to latents
 
-        self.to_state_latent = Sequential(RMSNorm(dim), LinearNoBias(dim, dim_state_latent), nn.Tanh())
+        self.to_state_latent = Sequential(RMSNorm(dim), LinearNoBias(dim, dim_state_latent), SoftClamp(state_latent_clamp_value))
         self.to_action_latent = Sequential(RMSNorm(dim), LinearNoBias(dim, dim_action_latent), nn.Tanh())
 
         # in my experiments, EMA model still outperforms this hyped sigreg regularization.. but i may be seeing an improvement with EMA + sigreg, so lets just allow for all possibilities.
@@ -444,8 +457,7 @@ class WorldModel(Module):
 
         # means and std
 
-        num_elites = int(elite_frac * pop_size)
-        assert num_elites >= 1
+        num_elites = max(int(elite_frac * pop_size), 1)
 
         shape = (batch, 1, horizon, dim_action)
 
@@ -484,8 +496,8 @@ class WorldModel(Module):
 
                 step_state_latents = step_state_latents + step_residual
 
-                if clamp_state_latent_to_range:
-                    step_state_latents.clamp_(-1., 1.)
+                if clamp_state_latent_to_range and exists(self.state_latent_clamp_value) and self.state_latent_clamp_value > 0.:
+                    step_state_latents.clamp_(-self.state_latent_clamp_value, self.state_latent_clamp_value)
 
                 pred_state_latents.append(step_state_latents)
 
