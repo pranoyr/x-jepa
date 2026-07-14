@@ -433,14 +433,15 @@ class WorldModel(Module):
 
         # search space and some validation while it is still incomplete
 
-        search_space = default(search_space, 'encoded_latent' if not self.continuous_actions or self.transition_action_space != 'raw' else 'raw')
+        can_search_raw_actions = self.continuous_actions and self.transition_action_space != 'latent' and exists(self.dim_action)
+        search_space = default(search_space, 'raw' if can_search_raw_actions else 'encoded_latent')
 
         if self.transition_action_space == 'raw':
             assert search_space == 'raw'
         elif self.transition_action_space == 'latent':
             assert search_space == 'encoded_latent'
         elif search_space == 'raw':
-            assert self.continuous_actions
+            assert self.continuous_actions and exists(self.dim_action), 'searching in raw action space requires continuous actions and `dim_action` to be set'
 
         is_search_space_raw_action = search_space == 'raw'
         dim_action = self.dim_transition_action_input if not is_search_space_raw_action else self.dim_action
@@ -497,8 +498,12 @@ class WorldModel(Module):
             actions_cond = actions
 
             if is_search_space_raw_action and self.transition_action_space == 'encoded':
+                actions_cond, unpack = pack_with_inverse(actions_cond, '* h d')
+
                 actions_cond = self.action_encoder(actions_cond)
                 actions_cond = self.to_action_latent(actions_cond)
+
+                actions_cond = unpack(actions_cond)
 
             # accumulating predictions across horizon
 
