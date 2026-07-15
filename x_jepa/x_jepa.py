@@ -38,6 +38,8 @@ from x_jepa.min_gru import minGRUBlocks
 
 LinearNoBias = partial(Linear, bias = False)
 
+States = Tensor | list[Tensor] | tuple[Tensor, ...]
+
 Losses = namedtuple('Losses', [
     'next_state_latent_pred',
     'plan_state_pred',
@@ -68,6 +70,9 @@ def identity(t):
 
 def is_empty(t):
     return len(t) == 0
+
+def first(t):
+    return None if is_empty(t) else t[0]
 
 def batch_repeat(t, r):
     return repeat(t, 'b ... -> (b r) ...', r = r)
@@ -390,7 +395,7 @@ class WorldModel(Module):
     def __init__(
         self,
         *,
-        state_encoder: Module,
+        state_encoder: Module | ModuleList | list[Module] | tuple[Module, ...],
         action_encoder: Module,
         model: Module,
         action_decoder: Module | None = None,
@@ -441,7 +446,11 @@ class WorldModel(Module):
         self.dim_action_latent = dim_action_latent
         self.state_latent_clamp_value = state_latent_clamp_value
 
-        # state and action encoder / decoder
+        if not isinstance(state_encoder, (list, tuple, ModuleList)):
+            state_encoder = [state_encoder]
+
+        if isinstance(state_encoder, (list, tuple)):
+            state_encoder = ModuleList(state_encoder)
 
         self.state_encoder = state_encoder
 
@@ -531,7 +540,7 @@ class WorldModel(Module):
 
         self.ema_model = EMA(model, beta = ema_beta)
 
-        self.ema_state_encoder = EMA(state_encoder, beta = ema_beta)
+        self.ema_state_encoder = ModuleList([EMA(enc, beta = ema_beta) for enc in self.state_encoder])
 
         self.ema_state_transition = EMA(state_transition, beta = ema_beta)
         self.ema_state_transition_for_planning = EMA(self.state_transition_for_planning, beta = ema_beta)
@@ -603,8 +612,17 @@ class WorldModel(Module):
     def device(self):
         return self.zero.device
 
+    def _encode_states(
+        self,
+        encoder: ModuleList,
+        states: list[Tensor] | tuple[Tensor, ...]
+    ):
+        assert len(encoder) == len(states), 'number of states must match number of state encoders'
+        # todo: support multiple state tokens
+        return sum([enc(state) for enc, state in zip(encoder, states)])
+
     def update(self):
-        self.ema_state_encoder.update()
+        [ema.update() for ema in self.ema_state_encoder]
         self.ema_model.update()
         self.ema_state_transition.update()
         self.ema_state_transition_for_planning.update()
@@ -613,7 +631,7 @@ class WorldModel(Module):
     @temp_eval
     def plan(
         self,
-        states,
+        states: States,
         actions,
         fitness_fn: Callable[..., Tensor] | None = None,
         goal_state: Tensor | None = None,
@@ -629,8 +647,11 @@ class WorldModel(Module):
         memories = None,
         return_memories = False
     ):
-        batch, device = states.shape[0], self.device
-        state_len, action_len = states.shape[1], actions.shape[1]
+        if is_tensor(states):
+            states = [states]
+
+        batch, device = first(states).shape[0], self.device
+        state_len, action_len = first(states).shape[1], actions.shape[1]
 
         # search space and some validation while it is still incomplete
 
@@ -658,7 +679,7 @@ class WorldModel(Module):
 
         # get the state and action latents
 
-        state_tokens = self.state_encoder(states)
+        state_tokens = self._encode_states(self.state_encoder, states)
         action_tokens = self.action_encoder(actions)
 
         # handle memories
@@ -797,7 +818,10 @@ class WorldModel(Module):
             encoded_goal = None
 
             if exists(goal_state):
-                encoded_goal = self.ema_state_encoder(goal_state)
+                if is_tensor(goal_state):
+                    goal_state = [goal_state]
+
+                encoded_goal = self._encode_states(self.ema_state_encoder, goal_state)
                 encoded_goal = rearrange(encoded_goal, 'b d -> b 1 1 d')
 
             if exists(fitness_fn):
@@ -943,7 +967,7 @@ class WorldModel(Module):
 
     def forward(
         self,
-        states,
+        states: States,
         actions,
         returns = None,
         behavior_clone = True,
@@ -951,7 +975,10 @@ class WorldModel(Module):
         memories = None,
         return_memories = False
     ):
-        state_len, action_len = states.shape[1], actions.shape[1]
+        if is_tensor(states):
+            states = [states]
+
+        state_len, action_len = first(states).shape[1], actions.shape[1]
         assert action_len in {state_len, state_len - 1}
 
         orig_actions = actions
@@ -969,7 +996,7 @@ class WorldModel(Module):
 
         # encode the states and actions, todo: do mixture of transformers, a la VLAs
 
-        state_tokens = self.state_encoder(states)
+        state_tokens = self._encode_states(self.state_encoder, states)
         action_tokens = self.action_encoder(actions)
 
         # linear rnns for contextualizing states and actions separately, and for potential path integration and idm
@@ -1107,7 +1134,7 @@ class WorldModel(Module):
 
         pred_next_encoded_state = self.to_next_encoded_state_pred((state_latents, action_cond))
 
-        ema_encoded_state = self.ema_state_encoder(states)
+        ema_encoded_state = self._encode_states(self.ema_state_encoder, states)
 
         next_ema_encoded_state_target = ema_encoded_state[:, 1:]
 

@@ -6,6 +6,7 @@ from torch import nn, tensor, cat
 from torch.testing import assert_close
 
 from einops import reduce, rearrange
+from einops.layers.torch import Rearrange
 
 from x_jepa.x_jepa import WorldModel, Transformer
 from x_jepa.regularizers import SigReg, VISReg, uniform_wasserstein_loss
@@ -433,3 +434,35 @@ def test_interact_with_environment():
     assert len(experience.states) > 0
     assert len(experience.actions) == len(experience.states)
     assert len(experience.rewards) == len(experience.states)
+
+def test_multimodal():
+    image_encoder = nn.Sequential(Rearrange('... c h w -> ... (c h w)'), nn.Linear(48, 256))
+    vector_encoder = nn.Linear(128, 256)
+
+    model = Transformer(dim = 256, depth = 2)
+
+    world_model = WorldModel(
+        state_encoder = [image_encoder, vector_encoder],
+        action_encoder = nn.Linear(64, 256),
+        model = model,
+        dim_action = 64
+    )
+
+    images = torch.randn(2, 5, 3, 4, 4)
+    vectors = torch.randn(2, 5, 128)
+    actions = torch.randn(2, 4, 64)
+
+    loss, _ = world_model([images, vectors], actions)
+    loss.backward()
+
+    goal_images = torch.randn(2, 3, 4, 4)
+    goal_vectors = torch.randn(2, 128)
+
+    planned_actions = world_model.plan(
+        states = [images[:, :2], vectors[:, :2]],
+        actions = actions[:, :1],
+        goal_state = [goal_images, goal_vectors],
+        horizon = 2
+    )
+
+    assert planned_actions.shape[-1] == 64
