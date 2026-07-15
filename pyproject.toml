@@ -1,6 +1,6 @@
 [project]
 name = "x-jepa"
-version = "0.0.36"
+version = "0.0.37"
 description = "Explorations into JEPA"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -41,7 +41,8 @@ Repository = "https://codeberg.org/lucidrains/x-jepa"
 [project.optional-dependencies]
 examples = []
 test = [
-    "pytest"
+    "pytest",
+    "gymnasium"
 ]
 
 [tool.pytest.ini_options]

@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch.distributions import Beta
 from torch import nn, cat, stack, tensor, is_tensor, Tensor
 from torch.nn import Module, ModuleList, Linear, RMSNorm, Sequential
+from torch.utils._pytree import tree_map
 
 from einops import einsum, rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
@@ -27,6 +28,8 @@ from torch_einops_utils import (
 )
 
 from PoPE_pytorch import PoPE, apply_pope_to_qk
+
+from x_jepa.utils import EnvWrapper, Experience
 
 from x_jepa.regularizers import SigReg, uniform_wasserstein_loss
 from x_jepa.min_gru import minGRUBlocks
@@ -619,7 +622,9 @@ class WorldModel(Module):
         eps = 1e-5,
         clamp_state_latent_to_range = True,
         return_action_latent = False,
-        search_space: Literal['raw', 'local_global'] | None = None
+        search_space: Literal['raw', 'local_global'] | None = None,
+        memories = None,
+        return_memories = False
     ):
         batch, device = states.shape[0], self.device
         state_len, action_len = states.shape[1], actions.shape[1]
@@ -653,15 +658,35 @@ class WorldModel(Module):
         state_tokens = self.state_encoder(states)
         action_tokens = self.action_encoder(actions)
 
+        # handle memories
+
+        state_rnn_memories = action_rnn_memories = model_memories = None
+
+        if exists(memories):
+            state_rnn_memories, action_rnn_memories, model_memories = memories
+
         # linear rnns for contextualizing states and actions separately
 
-        rnn_state_tokens = self.state_linear_rnn(state_tokens)
+        rnn_state_tokens, next_state_rnn_memories = self.state_linear_rnn(
+            state_tokens,
+            memories = state_rnn_memories,
+            return_memories = True
+        )
 
-        rnn_action_tokens, past_action_rnn_memories = self.action_linear_rnn(action_tokens, return_memories = True)
+        rnn_action_tokens, next_action_rnn_memories = self.action_linear_rnn(
+            action_tokens,
+            memories = action_rnn_memories,
+            return_memories = True
+        )
 
         tokens = rearrange([rnn_state_tokens, rnn_action_tokens], 'sa b n d -> b (n sa) d')
 
-        embeds = self.ema_model(tokens)
+        (embeds, _), next_model_memories = self.ema_model(
+            tokens,
+            return_hiddens = True,
+            memories = model_memories,
+            return_memories = True
+        )
 
         state_embeds = embeds[:, -2] # (b d)
 
@@ -682,7 +707,7 @@ class WorldModel(Module):
 
         # precompute past rnn memories for rnn action latents, repeating to population size
 
-        past_rnn_memories = tree_map_tensor(partial(batch_repeat, r = pop_size), past_action_rnn_memories)
+        past_rnn_memories = tree_map_tensor(partial(batch_repeat, r = pop_size), next_action_rnn_memories)
 
         # iterate
 
@@ -827,10 +852,91 @@ class WorldModel(Module):
 
         # return
 
-        if not return_action_latent:
-            return decoded_actions
+        out = decoded_actions
 
-        return decoded_actions, winning_actions
+        if return_action_latent:
+            out = (decoded_actions, winning_actions)
+
+        if not return_memories:
+            return out
+
+        next_memories = (next_state_rnn_memories, next_action_rnn_memories, next_model_memories)
+        return out, next_memories
+
+    @torch.no_grad()
+    @temp_eval
+    def interact_with_environment(
+        self,
+        env,
+        max_steps = 1000,
+        fitness_fn = None,
+        goal_state = None,
+        return_cpu = True,
+        **plan_kwargs
+    ):
+        env = EnvWrapper(env, return_cpu = return_cpu)
+
+        states, actions, rewards, terminateds, truncateds, infos = [], [], [], [], [], []
+
+        state, info = env.reset()
+
+        batch, device = state.shape[0], state.device
+
+        memories = None
+
+        is_done = torch.zeros(batch, dtype = torch.bool, device = device)
+        cumulative_rewards = torch.zeros(batch, device = device)
+        episode_len = torch.zeros(batch, dtype = torch.long, device = device)
+
+        for step in range(max_steps):
+            is_last_step = step == (max_steps - 1)
+
+            states.append(state)
+            infos.append(info)
+
+            empty_actions = torch.empty(batch, 0, self.dim_action, device = self.device)
+            state = state.to(self.device)
+
+            planned_actions, memories = self.plan(
+                states = state.unsqueeze(1),
+                actions = empty_actions,
+                fitness_fn = fitness_fn,
+                goal_state = goal_state,
+                memories = memories,
+                return_memories = True,
+                **plan_kwargs
+            )
+
+            # pick the first action for now
+
+            action = planned_actions[:, 0]
+            actions.append(action.cpu() if return_cpu else action)
+
+            next_state, reward, terminated, truncated, info = env.step(action)
+
+            if is_done.any():
+                reward = reward.masked_fill(is_done, 0.)
+
+            cumulative_rewards.add_(reward)
+            episode_len.add_((~is_done).long())
+
+            if is_last_step:
+                truncated = truncated | ~is_done
+
+            is_done |= terminated | truncated
+
+            rewards.append(reward)
+            terminateds.append(terminated)
+            truncateds.append(truncated)
+
+            state = next_state
+
+            if is_done.all():
+                break
+
+        experience = (states, actions, rewards, terminateds, truncateds, infos, episode_len, cumulative_rewards)
+
+        return Experience(*experience)
 
     def forward(
         self,

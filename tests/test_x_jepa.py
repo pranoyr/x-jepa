@@ -351,3 +351,85 @@ def test_world_model_sequential_vs_parallel():
     sequential_embeds = cat(sequential_embeds, dim = 1)
 
     assert_close(parallel_embeds, sequential_embeds, atol = 1e-4, rtol = 1e-4)
+
+@torch.no_grad()
+def test_world_model_plan_with_memories():
+    model = Transformer(
+        dim = 128,
+        depth = 2,
+        causal = True
+    )
+
+    world_model = WorldModel(
+        model = model,
+        dim_action = 4,
+        state_encoder = nn.Linear(128, 128),
+        action_encoder = nn.Linear(4, 128),
+        action_decoder = nn.Linear(128, 4),
+        transition_action_space = 'local',
+        continuous_actions = True
+    )
+
+    world_model.eval()
+
+    batch_size = 2
+    memories = None
+    empty_actions = torch.empty(batch_size, 0, 4)
+
+    def fitness_fn(pred_state_latents):
+        return torch.randn(pred_state_latents.shape[:2]) # (b, p)
+
+    for _ in range(5):
+        step_state = torch.randn(batch_size, 1, 128)
+
+        planned_actions, memories = world_model.plan(
+            states = step_state,
+            actions = empty_actions,
+            fitness_fn = fitness_fn,
+            horizon = 2,
+            memories = memories,
+            return_memories = True
+        )
+
+        assert planned_actions.shape == (batch_size, 2, 4)
+
+        first_action = planned_actions[:, :1]
+        assert first_action.shape == (batch_size, 1, 4)
+
+@torch.no_grad()
+def test_interact_with_environment():
+    import gymnasium as gym
+
+    model = Transformer(
+        dim = 128,
+        depth = 2,
+        causal = True
+    )
+
+    world_model = WorldModel(
+        model = model,
+        dim_action = 2,
+        state_encoder = nn.Linear(4, 128),
+        action_encoder = nn.Linear(2, 128),
+        action_decoder = nn.Linear(128, 2),
+        transition_action_space = 'local',
+        continuous_actions = False
+    )
+
+    world_model.eval()
+
+    env = gym.make('CartPole-v1')
+
+    def fitness_fn(pred_state_latents):
+        return torch.randn(pred_state_latents.shape[:2])
+
+    experience = world_model.interact_with_environment(
+        env = env,
+        max_steps = 10,
+        fitness_fn = fitness_fn,
+        horizon = 2
+    )
+
+    assert len(experience.states) > 0
+    assert len(experience.actions) == len(experience.states)
+    assert len(experience.rewards) == len(experience.states)
