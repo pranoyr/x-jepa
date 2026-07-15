@@ -26,6 +26,8 @@ from torch_einops_utils import (
     pack_with_inverse
 )
 
+from PoPE_pytorch import PoPE, apply_pope_to_qk
+
 from x_jepa.regularizers import SigReg, uniform_wasserstein_loss
 from x_jepa.min_gru import minGRUBlocks
 
@@ -120,7 +122,8 @@ class Attention(Module):
 
     def forward(
         self,
-        tokens # (b n d)
+        tokens, # (b n d)
+        pope_pos_emb = None
     ):
         device = tokens.device
 
@@ -128,6 +131,9 @@ class Attention(Module):
 
         q, k, v = (self.to_q(tokens), *self.to_kv(tokens).chunk(2, dim = -1))
         q, k, v = (self.split_heads(t) for t in (q, k, v))
+
+        if exists(pope_pos_emb):
+            q, k = apply_pope_to_qk(pope_pos_emb, q, k)
 
         q = q * self.scale
 
@@ -214,10 +220,13 @@ class Transformer(Module):
         causal = True,
         dim_head = 64,
         heads = 8,
-        ff_expand_factor = 4.
+        ff_expand_factor = 4.,
+        use_pope = False
     ):
         super().__init__()
         self.dim = dim
+
+        self.pope = PoPE(dim_head, heads = heads) if use_pope else None
 
         layers = ModuleList([])
 
@@ -236,11 +245,14 @@ class Transformer(Module):
         prev_hiddens = None,
         return_hiddens = False
     ):
+        seq_len = tokens.shape[-2]
+        pope_pos_emb = self.pope(seq_len) if exists(self.pope) else None
+
         layer_hiddens = list(default(prev_hiddens, []))
         layer_hiddens.append(tokens)
 
         for attn_res, attn, ff in self.layers:
-            tokens = attn(tokens) + tokens
+            tokens = attn(tokens, pope_pos_emb = pope_pos_emb) + tokens
             tokens = ff(tokens) + tokens
 
             layer_hiddens.append(tokens)

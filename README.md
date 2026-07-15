@@ -108,12 +108,24 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
 
 ```bibtex
 @misc{liu2024singlegoalneedskills,
-    title   = {A Single Goal is All You Need: Skills and Exploration Emerge from Contrastive RL without Rewards, Demonstrations, or Subgoals}, 
+    title   = {A Single Goal is All You Need: Skills and Exploration Emerge from Contrastive RL without Rewards, Demonstrations, or Subgoals},
     author  = {Grace Liu and Michael Tang and Benjamin Eysenbach},
     year    = {2024},
     eprint  = {2408.05804},
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
-    url     = {https://arxiv.org/abs/2408.05804}, 
+    url     = {https://arxiv.org/abs/2408.05804},
+}
+```
+
+```bibtex
+@misc{gopalakrishnan2025decouplingwhatwherepolar,
+    title   = {Decoupling the "What" and "Where" With Polar Coordinate Positional Embeddings},
+    author  = {Anand Gopalakrishnan and Robert Csordás and Jürgen Schmidhuber and Michael C. Mozer},
+    year    = {2025},
+    eprint  = {2509.10534},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2509.10534},
 }
 ```

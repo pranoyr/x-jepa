@@ -258,3 +258,20 @@ def test_goal_flow_match():
     )
 
     assert sampled_goals.shape == (batch_size, dim)
+
+@param('use_pope', (False, True))
+def test_transformer(use_pope):
+    model = Transformer(
+        dim = 512,
+        depth = 2,
+        causal = True,
+        use_pope = use_pope
+    )
+
+    tokens = torch.randn(2, 10, 512)
+    out = model(tokens)
+
+    assert out.shape == (2, 10, 512)
+
+    loss = out.sum()
+    loss.backward()
