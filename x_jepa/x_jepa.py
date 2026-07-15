@@ -99,7 +99,7 @@ class Attention(Module):
     def __init__(
         self,
         dim,
-        dim_head = 64,
+        dim_head = 32,
         heads = 8,
         causal = True,
         prenorm = True
@@ -265,6 +265,80 @@ class Transformer(Module):
 
         return tokens, layer_hiddens
 
+# distributions
+
+class BetaDistrReadout(Module):
+    def __init__(
+        self,
+        source_range: tuple[float, float] = (0., 1.),
+        eps = 1e-5
+    ):
+        super().__init__()
+        self.source_range = source_range
+        self.eps = eps
+
+    def forward(
+        self,
+        x,
+        target = None,
+        sample = False,
+        temperature = 1.,
+        return_entropy = False,
+        return_raw = False,
+        return_distr = False
+    ):
+        source_min, source_max = self.source_range
+
+        # derive alpha and beta from the raw logits
+
+        alpha, beta = rearrange(x, '... (alpha_beta d) -> alpha_beta ... d', alpha_beta = 2)
+
+        alpha = F.softplus(alpha) + 1. + self.eps
+        beta = F.softplus(beta) + 1. + self.eps
+
+        # maybe apply temperature
+
+        if temperature != 1.:
+            alpha = (alpha - 1.) / temperature + 1.
+            beta = (beta - 1.) / temperature + 1.
+
+        if return_raw:
+            return alpha, beta
+
+        distr = Beta(alpha, beta)
+
+        # maybe calculate negative log probs if target is passed in
+
+        if exists(target):
+            # scale from source range to (0, 1) bounds for beta distribution
+            target = (target - source_min) / (source_max - source_min)
+
+            target = target.clamp(self.eps, 1. - self.eps)
+            return -distr.log_prob(target)
+
+        # maybe return the distribution itself
+
+        if return_distr:
+            return distr
+
+        # sample or get the mode
+
+        if sample:
+            out = distr.rsample()
+        else:
+            out = (alpha - 1.) / (alpha + beta - 2.).clamp_min(self.eps)
+
+        # scale back to source range
+
+        out = out * (source_max - source_min) + source_min
+
+        # maybe return entropy for naive exploration during planning
+
+        if not return_entropy:
+            return out
+
+        return out, distr.entropy()
+
 # classes
 
 class WorldModel(Module):
@@ -299,6 +373,9 @@ class WorldModel(Module):
         learn_goal_generator = False,
         goal_loss_weight = 1.,
         returns_norm_momentum = 0.01,
+        probabilistic_state_transition = False,
+        probabilistic_plan_state_transition = False,
+        state_transition_eps = 1e-5,
         reg: Module | None = None,
         reg_loss_kwargs: dict | None = None,
         state_linear_rnn_depth = 1,
@@ -356,13 +433,30 @@ class WorldModel(Module):
 
         assert xnor(need_learned_action_decoder, exists(action_decoder)), 'you need to pass in the action_decoder'
 
+        # probabilistic state transition related
+
+        self.probabilistic_state_transition = probabilistic_state_transition
+        self.probabilistic_plan_state_transition = probabilistic_plan_state_transition
+
+        if probabilistic_state_transition or probabilistic_plan_state_transition:
+            assert state_latent_clamp_value > 0., 'state_latent_clamp_value must be greater than 0 if either probabilistic state transition is turned on'
+
+        if probabilistic_state_transition:
+            self.state_transition_beta_distr = BetaDistrReadout(source_range = (-state_latent_clamp_value, state_latent_clamp_value), eps = state_transition_eps)
+
+        if probabilistic_plan_state_transition:
+            self.plan_state_transition_beta_distr = BetaDistrReadout(source_range = (-state_latent_clamp_value, state_latent_clamp_value), eps = state_transition_eps)
+
         # following Teoh, learn the residual with a 3 layer mlp, for both state transition functions, one for main forward dynamics, the other for planning
+        # if probabilistic, it learns the absolute state transition parameterized by a unimodal beta distribution instead of a residual
 
         if not exists(state_transition):
-            state_transition = MLP(dim_state_latent + dim_transition_action_input, *((dim * 2,) * 2), dim_state_latent)
+            dim_out = dim_state_latent * 2 if probabilistic_state_transition else dim_state_latent
+            state_transition = MLP(dim_state_latent + dim_transition_action_input, *((dim * 2,) * 2), dim_out)
 
         if not exists(state_transition_for_planning):
-            state_transition_for_planning = MLP(dim_state_latent + dim_transition_action_input, *((dim * 2,) * 2), dim_state_latent)
+            dim_out = dim_state_latent * 2 if probabilistic_plan_state_transition else dim_state_latent
+            state_transition_for_planning = MLP(dim_state_latent + dim_transition_action_input, *((dim * 2,) * 2), dim_out)
 
         self.dim_transition_action_input = dim_transition_action_input
 
@@ -414,6 +508,9 @@ class WorldModel(Module):
 
         self.continuous_actions = continuous_actions
         self.action_eps = action_eps
+
+        if self.continuous_actions:
+            self.action_beta_distr = BetaDistrReadout(source_range = (-1., 1.), eps = action_eps)
 
         # value head
 
@@ -583,6 +680,7 @@ class WorldModel(Module):
             pred_state_latents = []
             pred_next_encoded_states = []
             pred_values = []
+            pred_state_entropies = [] if self.probabilistic_plan_state_transition else None
 
             # step through the learnt world model
 
@@ -596,12 +694,20 @@ class WorldModel(Module):
 
                 # state transition
 
-                pred_next_state_latent_residual = self.ema_state_transition_for_planning((step_state_latents, step_action_cond))
+                if self.probabilistic_plan_state_transition:
+                    pred_next_state_logits = self.ema_state_transition_for_planning((step_state_latents, step_action_cond))
+                    step_state_latents, step_entropy = self.plan_state_transition_beta_distr(
+                        pred_next_state_logits,
+                        sample = True,
+                        return_entropy = True
+                    )
+                    pred_state_entropies.append(step_entropy)
+                else:
+                    pred_next_state_latent_residual = self.ema_state_transition_for_planning((step_state_latents, step_action_cond))
+                    step_state_latents = step_state_latents + pred_next_state_latent_residual
 
-                step_state_latents = step_state_latents + pred_next_state_latent_residual
-
-                if clamp_state_latent_to_range and exists(self.state_latent_clamp_value) and self.state_latent_clamp_value > 0.:
-                    step_state_latents.clamp_(-self.state_latent_clamp_value, self.state_latent_clamp_value)
+                    if clamp_state_latent_to_range and exists(self.state_latent_clamp_value) and self.state_latent_clamp_value > 0.:
+                        step_state_latents.clamp_(-self.state_latent_clamp_value, self.state_latent_clamp_value)
 
                 pred_state_latents.append(step_state_latents)
 
@@ -611,6 +717,8 @@ class WorldModel(Module):
                 pred_values.append(step_pred_value)
 
             pred_state_latents = rearrange(pred_state_latents, 'h b p d -> b p h d')
+            if exists(pred_state_entropies):
+                pred_state_entropies = rearrange(pred_state_entropies, 'h b p d -> b p h d')
 
             pred_next_encoded_states = rearrange(pred_next_encoded_states, 'h b p d -> b p h d')
             pred_values = rearrange(pred_values, 'h b p 1 -> b p h')
@@ -632,7 +740,8 @@ class WorldModel(Module):
                     pred_state_latents = pred_state_latents,
                     pred_next_encoded_states = pred_next_encoded_states,
                     pred_values = pred_values,
-                    encoded_goal = encoded_goal
+                    encoded_goal = encoded_goal,
+                    pred_state_entropies = pred_state_entropies
                 )
 
                 allowed_params = set(kwargs.keys())
@@ -748,21 +857,45 @@ class WorldModel(Module):
 
         action_cond = action_cond[:, :state_latents.shape[1]]
 
-        # prediction
+        # state transition prediction
 
-        pred_residual = self.state_transition((state_latents, action_cond))
+        if self.probabilistic_state_transition:
+            # probabilistic
 
-        next_state_pred = state_latents + pred_residual
+            next_state_pred_logits = self.state_transition((state_latents, action_cond))
 
-        next_state_latent_pred_loss = F.smooth_l1_loss(next_state_pred, next_target_state_latents.detach())
+            neg_log_probs = self.state_transition_beta_distr(next_state_pred_logits, target = next_target_state_latents.detach())
+            next_state_latent_pred_loss = neg_log_probs.sum(dim = -1).mean()
+
+            # for next_state_pred to be accessible for reg loss if needed
+
+            next_state_pred = self.state_transition_beta_distr(next_state_pred_logits)
+        else:
+            # deterministic
+
+            pred_residual = self.state_transition((state_latents, action_cond))
+
+            next_state_pred = state_latents + pred_residual
+
+            next_state_latent_pred_loss = F.smooth_l1_loss(next_state_pred, next_target_state_latents.detach())
 
         # prediction for planning transition, where actions can be in raw, local encoded, or global encoded
 
-        pred_residual_for_planning = self.state_transition_for_planning((state_latents, action_cond))
+        if self.probabilistic_plan_state_transition:
+            # probabilistic
 
-        next_state_pred_for_plan = state_latents + pred_residual_for_planning
+            next_state_pred_logits_plan = self.state_transition_for_planning((state_latents, action_cond))
 
-        plan_state_pred_loss = F.smooth_l1_loss(next_state_pred_for_plan, next_target_state_latents.detach())
+            neg_log_probs = self.plan_state_transition_beta_distr(next_state_pred_logits_plan, target = next_target_state_latents.detach())
+            plan_state_pred_loss = neg_log_probs.sum(dim = -1).mean()
+        else:
+            # deterministic
+
+            pred_residual_for_planning = self.state_transition_for_planning((state_latents, action_cond))
+
+            next_state_pred_for_plan = state_latents + pred_residual_for_planning
+
+            plan_state_pred_loss = F.smooth_l1_loss(next_state_pred_for_plan, next_target_state_latents.detach())
 
         # action decoder
 
@@ -823,18 +956,8 @@ class WorldModel(Module):
             if self.continuous_actions:
                 # use unimodal beta
 
-                alpha, beta = rearrange(next_action_pred, 'b n (alpha_beta na) -> alpha_beta b n na', alpha_beta = 2)
-                alpha = F.softplus(alpha) + 1. + self.action_eps
-                beta = F.softplus(beta) + 1. + self.action_eps
-
-                distr = Beta(alpha, beta)
-
-                next_actions_zero_one = (next_actions + 1) / 2
-                next_actions_zero_one = next_actions_zero_one.clamp(self.action_eps, 1. - self.action_eps)
-
-                log_probs = distr.log_prob(next_actions_zero_one).sum(dim = -1)
-
-                bc_loss = -log_probs.mean()
+                neg_log_probs = self.action_beta_distr(next_action_pred, target = next_actions)
+                bc_loss = neg_log_probs.sum(dim = -1).mean()
 
             else:
                 bc_loss = F.cross_entropy(rearrange(next_action_pred, 'b n c -> b c n'), next_actions)
