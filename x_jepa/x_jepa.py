@@ -55,8 +55,8 @@ Losses = namedtuple('Losses', [
     'action_wasserstein',
     'goal',
     'temporal_straightening',
-    'align_state_action',
-    'align_state_action_sigreg'
+    'align_pre_state_action_repr',
+    'align_pre_state_action_repr_sigreg'
 ])
 
 # helpers
@@ -455,8 +455,8 @@ class WorldModel(Module):
         reg_next_encoded_weight = 0.,
         action_latent_wasserstein_loss_weight = 0.,
         temporal_straightening_loss_weight = 0.,
-        align_state_action_loss_weight = 0.,
-        align_state_action_sigreg_weight = 0.,
+        align_pre_state_action_repr_loss_weight = 0.,
+        align_pre_state_action_repr_sigreg_weight = 0.,
         learn_goal_generator = False,
         goal_loss_weight = 1.,
         returns_norm_momentum = 0.01,
@@ -644,17 +644,17 @@ class WorldModel(Module):
 
         self.action_latent_wasserstein_loss_weight = action_latent_wasserstein_loss_weight
 
-        self.align_state_action_loss_weight = align_state_action_loss_weight
-        self.align_state_action_sigreg_weight = align_state_action_sigreg_weight
+        self.align_pre_state_action_repr_loss_weight = align_pre_state_action_repr_loss_weight
+        self.align_pre_state_action_repr_sigreg_weight = align_pre_state_action_repr_sigreg_weight
 
         self.has_reg_next_state = reg_next_state_weight > 0.
         self.has_reg_next_encoded = reg_next_encoded_weight > 0.
         self.has_action_latent_wasserstein_loss = action_latent_wasserstein_loss_weight > 0.
         self.has_temporal_straightening_loss = temporal_straightening_loss_weight > 0.
-        self.has_align_state_action_loss = align_state_action_loss_weight > 0.
-        self.has_align_state_action_sigreg = align_state_action_sigreg_weight > 0.
+        self.has_align_pre_state_action_repr_loss = align_pre_state_action_repr_loss_weight > 0.
+        self.has_align_pre_state_action_repr_sigreg = align_pre_state_action_repr_sigreg_weight > 0.
 
-        if self.has_align_state_action_loss:
+        if self.has_align_pre_state_action_repr_loss:
             self.state_to_action_pred = MLP(dim, *((dim * 2,) * 2), dim)
             self.action_to_state_pred = MLP(dim, *((dim * 2,) * 2), dim)
 
@@ -1114,23 +1114,29 @@ class WorldModel(Module):
 
         # levljepa cross-modal prediction between states and actions
 
-        align_state_action_loss = self.zero
-        align_state_action_sigreg_loss = self.zero
+        align_pre_state_action_repr_loss = self.zero
+        align_pre_state_action_repr_sigreg_loss = self.zero
 
-        if self.has_align_state_action_loss:
-            pred_action_from_state = self.state_to_action_pred(rnn_state_tokens)
-            pred_state_from_action = self.action_to_state_pred(rnn_action_tokens)
+        if (
+            self.has_align_pre_state_action_repr_loss or
+            self.has_align_pre_state_action_repr_sigreg
+        ):
+            align_state_tokens, align_action_tokens = rnn_state_tokens[:, 1:], rnn_action_tokens[:, :-1]
 
-            align_state_action_loss = (
-                F.mse_loss(pred_action_from_state, rnn_action_tokens.detach()) +
-                F.mse_loss(pred_state_from_action, rnn_state_tokens.detach())
-            ) / 2
+            if self.has_align_pre_state_action_repr_loss:
+                pred_action_from_state = self.state_to_action_pred(align_state_tokens)
+                pred_state_from_action = self.action_to_state_pred(align_action_tokens)
 
-        if self.has_align_state_action_sigreg:
-            align_state_action_sigreg_loss = (
-                self.reg(rnn_state_tokens) +
-                self.reg(rnn_action_tokens)
-            ) / 2
+                align_pre_state_action_repr_loss = (
+                    F.mse_loss(pred_action_from_state, align_action_tokens.detach()) +
+                    F.mse_loss(pred_state_from_action, align_state_tokens.detach())
+                ) / 2
+
+            if self.has_align_pre_state_action_repr_sigreg:
+                align_pre_state_action_repr_sigreg_loss = (
+                    self.reg(align_state_tokens) +
+                    self.reg(align_action_tokens)
+                ) / 2
 
         # now we interleave the states and actions
 
@@ -1387,8 +1393,8 @@ class WorldModel(Module):
             reg_next_encoded_loss * self.reg_next_encoded_weight +
             action_wasserstein_loss * self.action_latent_wasserstein_loss_weight +
             temporal_straightening_loss_val * self.temporal_straightening_loss_weight +
-            align_state_action_loss * self.align_state_action_loss_weight +
-            align_state_action_sigreg_loss * self.align_state_action_sigreg_weight +
+            align_pre_state_action_repr_loss * self.align_pre_state_action_repr_loss_weight +
+            align_pre_state_action_repr_sigreg_loss * self.align_pre_state_action_repr_sigreg_weight +
             goal_loss * self.goal_loss_weight
         )
 
@@ -1404,8 +1410,8 @@ class WorldModel(Module):
             action_wasserstein_loss,
             goal_loss,
             temporal_straightening_loss_val,
-            align_state_action_loss,
-            align_state_action_sigreg_loss
+            align_pre_state_action_repr_loss,
+            align_pre_state_action_repr_sigreg_loss
         )
 
         out = (total_loss, loss_breakdown)

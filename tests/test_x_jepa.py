@@ -17,14 +17,14 @@ from x_jepa.goals import FlowMatching, GoalGenerator
 @param('use_reg', (False, True))
 @param('reg_type', ('sigreg', 'visreg'))
 @param('probabilistic', (False, True))
-@param('levl_jepa_align', (False, True))
+@param('align_pre_state_action_repr', (False, True))
 def test_world_model(
     plan_type,
     transition_action_space,
     use_reg,
     reg_type,
     probabilistic,
-    levl_jepa_align
+    align_pre_state_action_repr
 ):
     model = Transformer(
         dim = 512,
@@ -51,8 +51,8 @@ def test_world_model(
         probabilistic_state_transition = probabilistic,
         probabilistic_plan_state_transition = probabilistic,
         state_latent_clamp_value = 10.,
-        align_state_action_loss_weight = 1. if levl_jepa_align else 0.,
-        align_state_action_sigreg_weight = 1. if levl_jepa_align else 0.
+        align_pre_state_action_repr_loss_weight = 1. if align_pre_state_action_repr else 0.,
+        align_pre_state_action_repr_sigreg_weight = 1. if align_pre_state_action_repr else 0.
     )
 
     states = torch.randn(2, 10, 128)
