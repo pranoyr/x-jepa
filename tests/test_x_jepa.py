@@ -61,7 +61,7 @@ def test_world_model(
 
     loss, loss_breakdown = world_model(states, actions, returns = returns)
 
-    assert len(loss_breakdown) == 13
+    assert len(loss_breakdown) == 16
     assert loss.ndim == 0
     loss.backward()
 
@@ -502,3 +502,43 @@ def test_multimodal(complex_sensory):
     )
 
     assert planned_actions.shape[-1] == 64
+
+def test_vljepa_cross_sensory_alignment():
+    # eyes, ears, proprioception
+
+    eyes = nn.Linear(3, 256)
+    ear = nn.Linear(5, 256)
+    proprioception = nn.Linear(8, 256)
+
+    model = Transformer(
+        dim = 256,
+        depth = 2
+    )
+
+    world_model = WorldModel(
+        model = model,
+        state_encoder = nn.ModuleList([eyes, ear, proprioception]),
+        action_encoder = nn.Linear(4, 256),
+        dim_action = 4,
+        num_sensory_views = (2, 1, 1),
+        cross_sensory_align_pairs = [(0, 1), (0, 2)],
+        cross_sensory_align_loss_weight = 1.,
+        cross_sensory_align_sigreg_weight = 1.
+    )
+
+    states = (
+        (torch.randn(2, 2, 3), torch.randn(2, 2, 3)),
+        torch.randn(2, 2, 5),
+        torch.randn(2, 2, 8)
+    )
+
+    actions = torch.randn(2, 2, 4)
+
+    loss, losses = world_model(
+        states = states,
+        actions = actions
+    )
+
+    print(losses.cross_sensory_align_breakdown)
+
+    loss.backward()

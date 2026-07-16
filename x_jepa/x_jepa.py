@@ -56,8 +56,13 @@ Losses = namedtuple('Losses', [
     'goal',
     'temporal_straightening',
     'align_pre_state_action_repr',
-    'align_pre_state_action_repr_sigreg'
+    'align_pre_state_action_repr_sigreg',
+    'cross_sensory_align',
+    'cross_sensory_align_sigreg',
+    'cross_sensory_align_breakdown'
 ])
+
+CrossSensoryPairLoss = namedtuple('CrossSensoryPairLoss', ['src', 'tgt', 'loss'])
 
 # helpers
 
@@ -467,7 +472,10 @@ class WorldModel(Module):
         reg_loss_kwargs: dict | None = None,
         state_linear_rnn_depth = 1,
         action_linear_rnn_depth = 1,
-        num_sensory_views: tuple[int, ...] | None = None
+        num_sensory_views: tuple[int, ...] | None = None,
+        cross_sensory_align_pairs: list[tuple[int, int]] | None = None,
+        cross_sensory_align_loss_weight: float = 1.,
+        cross_sensory_align_sigreg_weight: float = 0.
     ):
         super().__init__()
 
@@ -597,8 +605,6 @@ class WorldModel(Module):
 
         # actor / behavior clone
 
-        self.has_actor = exists(actor_model) and exists(dim_action) and actor_loss_weight > 0.
-
         self.actor_state_encoder = MLP(dim_state_latent + dim, dim)
         self.actor_action_encoder = MLP(dim_transition_action_input + dim, dim)
 
@@ -614,6 +620,8 @@ class WorldModel(Module):
         self.pass_sensory_hiddens_to_actor = pass_sensory_hiddens_to_actor
 
         self.to_next_action_preds = None
+
+        self.has_actor = exists(actor_model) and exists(dim_action) and actor_loss_weight > 0.
 
         if self.has_actor:
             if self.pass_sensory_hiddens_to_actor:
@@ -644,19 +652,37 @@ class WorldModel(Module):
 
         self.action_latent_wasserstein_loss_weight = action_latent_wasserstein_loss_weight
 
+        # experimental alignment between states and actions
+        # note: one's actions is a special modality, should be contrasted with other actions in multiagent setting
+
         self.align_pre_state_action_repr_loss_weight = align_pre_state_action_repr_loss_weight
         self.align_pre_state_action_repr_sigreg_weight = align_pre_state_action_repr_sigreg_weight
 
-        self.has_reg_next_state = reg_next_state_weight > 0.
-        self.has_reg_next_encoded = reg_next_encoded_weight > 0.
-        self.has_action_latent_wasserstein_loss = action_latent_wasserstein_loss_weight > 0.
-        self.has_temporal_straightening_loss = temporal_straightening_loss_weight > 0.
         self.has_align_pre_state_action_repr_loss = align_pre_state_action_repr_loss_weight > 0.
         self.has_align_pre_state_action_repr_sigreg = align_pre_state_action_repr_sigreg_weight > 0.
 
         if self.has_align_pre_state_action_repr_loss:
             self.state_to_action_pred = MLP(dim, *((dim * 2,) * 2), dim)
             self.action_to_state_pred = MLP(dim, *((dim * 2,) * 2), dim)
+
+        # cross sensory alignment (vljepa method)
+
+        self.cross_sensory_align_pairs = cross_sensory_align_pairs
+        self.cross_sensory_align_loss_weight = cross_sensory_align_loss_weight
+        self.cross_sensory_align_sigreg_weight = cross_sensory_align_sigreg_weight
+
+        self.has_cross_sensory_align = exists(cross_sensory_align_pairs) and len(cross_sensory_align_pairs) > 0
+        self.has_cross_sensory_align_sigreg = cross_sensory_align_sigreg_weight > 0.
+
+        if self.has_cross_sensory_align:
+            self.cross_sensory_preds = ModuleList([])
+
+            for src_idx, tgt_idx in self.cross_sensory_align_pairs:
+                src_dim = self.num_sensory_views[src_idx] * dim
+                tgt_dim = self.num_sensory_views[tgt_idx] * dim
+                self.cross_sensory_preds.append(MLP(src_dim, src_dim * 2, src_dim * 2, tgt_dim))
+
+
 
         # goal generator
 
@@ -681,6 +707,11 @@ class WorldModel(Module):
         self.action_latent_wasserstein_loss_weight = action_latent_wasserstein_loss_weight
         self.temporal_straightening_loss_weight = temporal_straightening_loss_weight
 
+        self.has_reg_next_state = reg_next_state_weight > 0.
+        self.has_reg_next_encoded = reg_next_encoded_weight > 0.
+        self.has_action_latent_wasserstein_loss = action_latent_wasserstein_loss_weight > 0.
+        self.has_temporal_straightening_loss = temporal_straightening_loss_weight > 0.
+
         self.register_buffer('zero', tensor(0.), persistent = False)
 
     @property
@@ -696,13 +727,14 @@ class WorldModel(Module):
 
         encoded = []
         sensory_layer_hiddens = []
+        sensory_for_alignment = []
 
         for enc, state, views, view_emb in zip(encoder, states, self.num_sensory_views, self.view_embs):
             has_multi_views = views > 1
 
             if has_multi_views:
                 assert isinstance(state, (list, tuple)) and len(state) == views
-                state = rearrange(state, 'v b ... -> (v b) ...')
+                state = rearrange(list(state), 'v b ... -> (v b) ...')
 
             embed = enc(state)
 
@@ -712,11 +744,15 @@ class WorldModel(Module):
                 if exists(view_emb):
                     embed = einx.add('v ... d, v d -> v ... d', embed, view_emb)
 
+                sensory_for_alignment.append(rearrange(embed, 'v b n d -> b n (v d)'))
+            else:
+                sensory_for_alignment.append(embed)
+
             embeds = list(embed) if has_multi_views else [embed]
             encoded.extend(embeds)
             sensory_layer_hiddens.extend(embeds)
 
-        return sum(encoded), sensory_layer_hiddens
+        return sum(encoded), sensory_layer_hiddens, sensory_for_alignment
 
     def update(self):
         [ema.update() for ema in self.ema_state_encoder]
@@ -776,7 +812,7 @@ class WorldModel(Module):
 
         # get the state and action latents
 
-        state_tokens, sensory_layer_hiddens = self.encode_states(self.state_encoder, states)
+        state_tokens, sensory_layer_hiddens, _ = self.encode_states(self.state_encoder, states)
         action_tokens = self.action_encoder(actions)
 
         # handle memories
@@ -918,7 +954,7 @@ class WorldModel(Module):
                 if is_tensor(goal_state):
                     goal_state = [goal_state]
 
-                encoded_goal, ema_encoded_goal = self.encode_states(self.ema_state_encoder, goal_state)
+                encoded_goal, _, _ = self.encode_states(self.ema_state_encoder, goal_state)
                 encoded_goal = rearrange(encoded_goal, 'b d -> b 1 1 d')
 
             if exists(fitness_fn):
@@ -1095,7 +1131,7 @@ class WorldModel(Module):
 
         # encode the states and actions, todo: do mixture of transformers, a la VLAs
 
-        state_tokens, sensory_layer_hiddens = self.encode_states(self.state_encoder, states)
+        state_tokens, sensory_layer_hiddens, sensory_for_alignment = self.encode_states(self.state_encoder, states)
         action_tokens = self.action_encoder(actions)
 
         # linear rnns for contextualizing states and actions separately, and for potential path integration and idm
@@ -1128,8 +1164,8 @@ class WorldModel(Module):
                 pred_state_from_action = self.action_to_state_pred(align_action_tokens)
 
                 align_pre_state_action_repr_loss = (
-                    F.mse_loss(pred_action_from_state, align_action_tokens.detach()) +
-                    F.mse_loss(pred_state_from_action, align_state_tokens.detach())
+                    F.mse_loss(pred_action_from_state, align_action_tokens) +
+                    F.mse_loss(pred_state_from_action, align_state_tokens)
                 ) / 2
 
             if self.has_align_pre_state_action_repr_sigreg:
@@ -1137,6 +1173,35 @@ class WorldModel(Module):
                     self.reg(align_state_tokens) +
                     self.reg(align_action_tokens)
                 ) / 2
+
+        # cross sensory alignment (vljepa method)
+
+        cross_sensory_align_loss = self.zero
+        cross_sensory_align_sigreg_loss = self.zero
+        cross_sensory_align_breakdown = tuple()
+
+        if self.has_cross_sensory_align:
+            if self.has_cross_sensory_align_sigreg:
+                unique_indices = {idx for pair in self.cross_sensory_align_pairs for idx in pair}
+
+                for idx in unique_indices:
+                    cross_sensory_align_sigreg_loss = cross_sensory_align_sigreg_loss + self.reg(sensory_for_alignment[idx])
+
+                cross_sensory_align_sigreg_loss = cross_sensory_align_sigreg_loss / len(unique_indices)
+
+            pair_losses = []
+            for (src_idx, tgt_idx), predictor in zip(self.cross_sensory_align_pairs, self.cross_sensory_preds):
+                src_align_tokens = sensory_for_alignment[src_idx]
+                tgt_align_tokens = sensory_for_alignment[tgt_idx]
+
+                pred_tgt = predictor(src_align_tokens)
+                pair_loss = F.mse_loss(pred_tgt, tgt_align_tokens)
+
+                cross_sensory_align_loss = cross_sensory_align_loss + pair_loss
+                pair_losses.append(CrossSensoryPairLoss(src_idx, tgt_idx, pair_loss))
+
+            cross_sensory_align_loss = cross_sensory_align_loss / len(self.cross_sensory_align_pairs)
+            cross_sensory_align_breakdown = tuple(pair_losses)
 
         # now we interleave the states and actions
 
@@ -1272,7 +1337,7 @@ class WorldModel(Module):
 
         pred_next_encoded_state = self.to_next_encoded_state_pred((state_latents, action_cond))
 
-        ema_encoded_state, ema_sensory_layer_hiddens = self.encode_states(self.ema_state_encoder, states)
+        ema_encoded_state, ema_sensory_layer_hiddens, _ = self.encode_states(self.ema_state_encoder, states)
 
         next_ema_encoded_state_target = ema_encoded_state[:, 1:]
 
@@ -1360,17 +1425,17 @@ class WorldModel(Module):
 
         # action latent uniform loss
 
-        action_wasserstein_loss = self.zero
+        action_latent_wasserstein_loss = self.zero
 
         if self.has_action_latent_wasserstein_loss:
-            action_wasserstein_loss = uniform_wasserstein_loss(action_cond)
+            action_latent_wasserstein_loss = uniform_wasserstein_loss(action_cond)
 
         # temporal straightening loss
 
-        temporal_straightening_loss_val = self.zero
+        temporal_straightening_loss = self.zero
 
         if self.has_temporal_straightening_loss:
-            temporal_straightening_loss_val = temporal_straightening_loss(state_latents_full)
+            temporal_straightening_loss = temporal_straightening_loss(state_latents_full)
 
         # goal generator loss
 
@@ -1385,22 +1450,6 @@ class WorldModel(Module):
 
         # losses
 
-        total_loss = (
-            next_state_latent_pred_loss +
-            plan_state_pred_loss * self.plan_state_pred_loss_weight +
-            action_recon_loss * self.action_recon_loss_weight +
-            next_encoded_state_pred_loss * self.next_encoded_state_pred_loss_weight +
-            actor_loss * self.actor_loss_weight +
-            value_loss * self.value_loss_weight +
-            reg_next_state_loss * self.reg_next_state_weight +
-            reg_next_encoded_loss * self.reg_next_encoded_weight +
-            action_wasserstein_loss * self.action_latent_wasserstein_loss_weight +
-            temporal_straightening_loss_val * self.temporal_straightening_loss_weight +
-            align_pre_state_action_repr_loss * self.align_pre_state_action_repr_loss_weight +
-            align_pre_state_action_repr_sigreg_loss * self.align_pre_state_action_repr_sigreg_weight +
-            goal_loss * self.goal_loss_weight
-        )
-
         loss_breakdown = Losses(
             next_state_latent_pred_loss,
             plan_state_pred_loss,
@@ -1410,11 +1459,32 @@ class WorldModel(Module):
             value_loss,
             reg_next_state_loss,
             reg_next_encoded_loss,
-            action_wasserstein_loss,
+            action_latent_wasserstein_loss,
             goal_loss,
-            temporal_straightening_loss_val,
+            temporal_straightening_loss,
             align_pre_state_action_repr_loss,
-            align_pre_state_action_repr_sigreg_loss
+            align_pre_state_action_repr_sigreg_loss,
+            cross_sensory_align_loss,
+            cross_sensory_align_sigreg_loss,
+            cross_sensory_align_breakdown
+        )
+
+        total_loss = (
+            next_state_latent_pred_loss +
+            plan_state_pred_loss * self.plan_state_pred_loss_weight +
+            action_recon_loss * self.action_recon_loss_weight +
+            next_encoded_state_pred_loss * self.next_encoded_state_pred_loss_weight +
+            actor_loss * self.actor_loss_weight +
+            value_loss * self.value_loss_weight +
+            reg_next_state_loss * self.reg_next_state_weight +
+            reg_next_encoded_loss * self.reg_next_encoded_weight +
+            action_latent_wasserstein_loss * self.action_latent_wasserstein_loss_weight +
+            goal_loss * self.goal_loss_weight +
+            temporal_straightening_loss * self.temporal_straightening_loss_weight +
+            align_pre_state_action_repr_loss * self.align_pre_state_action_repr_loss_weight +
+            align_pre_state_action_repr_sigreg_loss * self.align_pre_state_action_repr_sigreg_weight +
+            cross_sensory_align_loss * self.cross_sensory_align_loss_weight +
+            cross_sensory_align_sigreg_loss * self.cross_sensory_align_sigreg_weight
         )
 
         out = (total_loss, loss_breakdown)
