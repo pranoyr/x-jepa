@@ -8,6 +8,8 @@ from collections import namedtuple
 import torch
 import torch.nn.functional as F
 from torch.distributions import Beta
+
+import einx
 from torch import nn, cat, stack, tensor, is_tensor, Tensor
 from torch.nn import Module, ModuleList, Linear, RMSNorm, Sequential
 from torch.utils._pytree import tree_map
@@ -21,6 +23,7 @@ from x_mlps_pytorch import MLP
 
 from torch_einops_utils import (
     pad_right_at_dim_to,
+    pad_right_ndim_to,
     temp_eval,
     batched_index_select,
     tree_map_tensor,
@@ -38,7 +41,7 @@ from x_jepa.min_gru import minGRUBlocks
 
 LinearNoBias = partial(Linear, bias = False)
 
-States = Tensor | list[Tensor] | tuple[Tensor, ...]
+States = Tensor | tuple[Tensor | list[Tensor], ...] | list[Tensor | list[Tensor]]
 
 Losses = namedtuple('Losses', [
     'next_state_latent_pred',
@@ -51,7 +54,9 @@ Losses = namedtuple('Losses', [
     'reg_next_encoded',
     'action_wasserstein',
     'goal',
-    'temporal_straightening'
+    'temporal_straightening',
+    'align_state_action',
+    'align_state_action_sigreg'
 ])
 
 # helpers
@@ -71,6 +76,13 @@ def identity(t):
 def is_empty(t):
     return len(t) == 0
 
+def first_tensor(t):
+    if is_tensor(t):
+        return t
+    if isinstance(t, (list, tuple)):
+        return first_tensor(t[0])
+    return None
+
 def first(t):
     return None if is_empty(t) else t[0]
 
@@ -79,6 +91,9 @@ def batch_repeat(t, r):
 
 def max_neg_value(t):
     return -torch.finfo(t.dtype).max
+
+def SmallInitEmbed(shape, eps = 0.02):
+    return nn.Parameter(torch.randn(shape) * eps)
 
 # helper modules
 
@@ -440,6 +455,8 @@ class WorldModel(Module):
         reg_next_encoded_weight = 0.,
         action_latent_wasserstein_loss_weight = 0.,
         temporal_straightening_loss_weight = 0.,
+        align_state_action_loss_weight = 0.,
+        align_state_action_sigreg_weight = 0.,
         learn_goal_generator = False,
         goal_loss_weight = 1.,
         returns_norm_momentum = 0.01,
@@ -449,7 +466,8 @@ class WorldModel(Module):
         reg: Module | None = None,
         reg_loss_kwargs: dict | None = None,
         state_linear_rnn_depth = 1,
-        action_linear_rnn_depth = 1
+        action_linear_rnn_depth = 1,
+        num_sensory_views: tuple[int, ...] | None = None
     ):
         super().__init__()
 
@@ -465,18 +483,28 @@ class WorldModel(Module):
         self.dim_action_latent = dim_action_latent
         self.state_latent_clamp_value = state_latent_clamp_value
 
+        # handle state encoders
+        # which could have multiple states, and each could have multiple views (ie. eyes, ears)
+
         if not isinstance(state_encoder, (list, tuple, ModuleList)):
             state_encoder = [state_encoder]
 
-        if isinstance(state_encoder, (list, tuple)):
-            state_encoder = ModuleList(state_encoder)
+        self.state_encoder = ModuleList(state_encoder)
 
-        self.state_encoder = state_encoder
+        if not exists(num_sensory_views):
+            num_sensory_views = (1,) * len(self.state_encoder)
+
+        assert len(num_sensory_views) == len(self.state_encoder)
+        self.num_sensory_views = num_sensory_views
+
+        self.view_embs = nn.ParameterList([SmallInitEmbed((v, dim)) if v > 1 else None for v in self.num_sensory_views])
 
         if pass_sensory_hiddens_to_world_model or pass_sensory_hiddens_to_actor:
             assert len(self.state_encoder) > 1, 'passing sensory layers to attention residual requires more than one modality'
 
         self.action_encoder = action_encoder
+
+        # initial linear rnns before attending
 
         self.state_linear_rnn = minGRUBlocks(dim = dim, depth = state_linear_rnn_depth)
         self.action_linear_rnn = minGRUBlocks(dim = dim, depth = action_linear_rnn_depth)
@@ -574,10 +602,10 @@ class WorldModel(Module):
         self.actor_state_encoder = MLP(dim_state_latent + dim, dim)
         self.actor_action_encoder = MLP(dim_transition_action_input + dim, dim)
 
-        if not isinstance(actor_model, (list, tuple, ModuleList)) and exists(actor_model):
-            actor_model = [actor_model]
+        if exists(actor_model):
+            if not isinstance(actor_model, (list, tuple, ModuleList)):
+                actor_model = [actor_model]
 
-        if isinstance(actor_model, (list, tuple)):
             actor_model = ModuleList(actor_model)
 
         self.actor_models = actor_model
@@ -616,6 +644,20 @@ class WorldModel(Module):
 
         self.action_latent_wasserstein_loss_weight = action_latent_wasserstein_loss_weight
 
+        self.align_state_action_loss_weight = align_state_action_loss_weight
+        self.align_state_action_sigreg_weight = align_state_action_sigreg_weight
+
+        self.has_reg_next_state = reg_next_state_weight > 0.
+        self.has_reg_next_encoded = reg_next_encoded_weight > 0.
+        self.has_action_latent_wasserstein_loss = action_latent_wasserstein_loss_weight > 0.
+        self.has_temporal_straightening_loss = temporal_straightening_loss_weight > 0.
+        self.has_align_state_action_loss = align_state_action_loss_weight > 0.
+        self.has_align_state_action_sigreg = align_state_action_sigreg_weight > 0.
+
+        if self.has_align_state_action_loss:
+            self.state_to_action_pred = MLP(dim, *((dim * 2,) * 2), dim)
+            self.action_to_state_pred = MLP(dim, *((dim * 2,) * 2), dim)
+
         # goal generator
 
         self.learn_goal_generator = learn_goal_generator
@@ -648,11 +690,33 @@ class WorldModel(Module):
     def encode_states(
         self,
         encoder: ModuleList,
-        states: list[Tensor] | tuple[Tensor, ...]
+        states: States
     ):
         assert len(encoder) == len(states), 'number of states must match number of state encoders'
-        encoded = [enc(state) for enc, state in zip(encoder, states)]
-        return sum(encoded), encoded
+
+        encoded = []
+        sensory_layer_hiddens = []
+
+        for enc, state, views, view_emb in zip(encoder, states, self.num_sensory_views, self.view_embs):
+            has_multi_views = views > 1
+
+            if has_multi_views:
+                assert isinstance(state, (list, tuple)) and len(state) == views
+                state = rearrange(state, 'v b ... -> (v b) ...')
+
+            embed = enc(state)
+
+            if has_multi_views:
+                embed = rearrange(embed, '(v b) ... -> v b ...', v = views)
+
+                if exists(view_emb):
+                    embed = einx.add('v ... d, v d -> v ... d', embed, view_emb)
+
+            embeds = list(embed) if has_multi_views else [embed]
+            encoded.extend(embeds)
+            sensory_layer_hiddens.extend(embeds)
+
+        return sum(encoded), sensory_layer_hiddens
 
     def update(self):
         [ema.update() for ema in self.ema_state_encoder]
@@ -683,8 +747,8 @@ class WorldModel(Module):
         if is_tensor(states):
             states = [states]
 
-        batch, device = first(states).shape[0], self.device
-        state_len, action_len = first(states).shape[1], actions.shape[1]
+        batch, device = first_tensor(states).shape[0], self.device
+        state_len, action_len = first_tensor(states).shape[1], actions.shape[1]
 
         # search space and some validation while it is still incomplete
 
@@ -1013,7 +1077,7 @@ class WorldModel(Module):
         if is_tensor(states):
             states = [states]
 
-        (batch, state_len), action_len = first(states).shape[:2], actions.shape[1]
+        (batch, state_len), action_len = first_tensor(states).shape[:2], actions.shape[1]
         assert action_len in {state_len, state_len - 1}
 
         orig_actions = actions
@@ -1047,6 +1111,26 @@ class WorldModel(Module):
             memories = action_rnn_memories,
             return_memories = True
         )
+
+        # levljepa cross-modal prediction between states and actions
+
+        align_state_action_loss = self.zero
+        align_state_action_sigreg_loss = self.zero
+
+        if self.has_align_state_action_loss:
+            pred_action_from_state = self.state_to_action_pred(rnn_state_tokens)
+            pred_state_from_action = self.action_to_state_pred(rnn_action_tokens)
+
+            align_state_action_loss = (
+                F.mse_loss(pred_action_from_state, rnn_action_tokens.detach()) +
+                F.mse_loss(pred_state_from_action, rnn_state_tokens.detach())
+            ) / 2
+
+        if self.has_align_state_action_sigreg:
+            align_state_action_sigreg_loss = (
+                self.reg(rnn_state_tokens) +
+                self.reg(rnn_action_tokens)
+            ) / 2
 
         # now we interleave the states and actions
 
@@ -1259,24 +1343,24 @@ class WorldModel(Module):
         reg_next_state_loss = self.zero
         reg_next_encoded_loss = self.zero
 
-        if self.reg_next_state_weight > 0.:
+        if self.has_reg_next_state:
             reg_next_state_loss = self.reg(next_state_pred)
 
-        if self.reg_next_encoded_weight > 0.:
+        if self.has_reg_next_encoded:
             reg_next_encoded_loss = self.reg(pred_next_encoded_state)
 
         # action latent uniform loss
 
         action_wasserstein_loss = self.zero
 
-        if self.action_latent_wasserstein_loss_weight > 0.:
+        if self.has_action_latent_wasserstein_loss:
             action_wasserstein_loss = uniform_wasserstein_loss(action_cond)
 
         # temporal straightening loss
 
         temporal_straightening_loss_val = self.zero
 
-        if self.temporal_straightening_loss_weight > 0.:
+        if self.has_temporal_straightening_loss:
             temporal_straightening_loss_val = temporal_straightening_loss(state_latents_full)
 
         # goal generator loss
@@ -1303,6 +1387,8 @@ class WorldModel(Module):
             reg_next_encoded_loss * self.reg_next_encoded_weight +
             action_wasserstein_loss * self.action_latent_wasserstein_loss_weight +
             temporal_straightening_loss_val * self.temporal_straightening_loss_weight +
+            align_state_action_loss * self.align_state_action_loss_weight +
+            align_state_action_sigreg_loss * self.align_state_action_sigreg_weight +
             goal_loss * self.goal_loss_weight
         )
 
@@ -1317,7 +1403,9 @@ class WorldModel(Module):
             reg_next_encoded_loss,
             action_wasserstein_loss,
             goal_loss,
-            temporal_straightening_loss_val
+            temporal_straightening_loss_val,
+            align_state_action_loss,
+            align_state_action_sigreg_loss
         )
 
         out = (total_loss, loss_breakdown)

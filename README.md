@@ -141,3 +141,15 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
     url     = {https://arxiv.org/abs/2603.12231},
 }
 ```
+
+```bibtex
+@misc{kuhn2026levljepaendtoendvisionlanguagepretraining,
+    title   = {LeVLJEPA: End-to-End Vision-Language Pretraining Without Negatives},
+    author  = {Lukas Kuhn and Giuseppe Serra and Randall Balestriero and Florian Buettner},
+    year    = {2026},
+    eprint  = {2607.00784},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CV},
+    url     = {https://arxiv.org/abs/2607.00784},
+}
+```
