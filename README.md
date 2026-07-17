@@ -1,6 +1,6 @@
 <img src="./jepa.png" width="400px"></img>
 
-## x-jepa
+## x-jepa (wip)
 
 Explorations into some of the approaches advocated by Yann LeCun, and just a more wholistic architecture (JEPA) in general
 

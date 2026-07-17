@@ -7,11 +7,11 @@ from collections import namedtuple
 
 import torch
 import torch.nn.functional as F
-from torch.distributions import Beta
+from torch.distributions import Beta, Categorical
 
 import einx
 from torch import nn, cat, stack, tensor, is_tensor, Tensor
-from torch.nn import Module, ModuleList, Linear, RMSNorm, Sequential
+from torch.nn import Module, ModuleList, ModuleDict, Linear, RMSNorm, Sequential
 from torch.utils._pytree import tree_map
 
 from einops import einsum, rearrange, repeat, reduce
@@ -51,6 +51,7 @@ Losses = namedtuple('Losses', [
     'action_recon',
     'next_encoded_state_pred',
     'actor',
+    'actor_losses',
     'value',
     'reg_next_state',
     'reg_next_encoded',
@@ -73,20 +74,23 @@ CrossSensoryPairLoss = namedtuple('CrossSensoryPairLoss', ['src', 'tgt', 'loss']
 def exists(v):
     return v is not None
 
-def cast_tuple(t, length = 1):
-    return t if isinstance(t, (tuple, list)) else ((t,) * length)
-
 def default(v, d):
     return v if exists(v) else d
-
-def xnor(x, y):
-    return x == y
 
 def identity(t):
     return t
 
 def is_empty(t):
     return len(t) == 0
+
+def bernoulli(prob):
+    return random.random() < prob
+
+def xnor(x, y):
+    return x == y
+
+def cast_tuple(t, length = 1):
+    return t if isinstance(t, (tuple, list)) else ((t,) * length)
 
 def first_tensor(t):
     if is_tensor(t):
@@ -101,6 +105,12 @@ def first(t):
 def log(t, eps = 1e-20):
     return torch.log(t.clamp(min = eps))
 
+def safe_divide(num, den, eps = 1e-5):
+    if not is_tensor(den):
+        return num / max(den, eps)
+
+    return num / den.clamp(min = eps)
+
 def l1norm(t, dim = -1):
     return F.normalize(t, p = 1, dim = dim)
 
@@ -109,6 +119,9 @@ def batch_repeat(t, r):
 
 def tree_map_tensor_to_device(tree, device):
     return tree_map_tensor(lambda t: t.to(device), tree)
+
+def tree_map_detach(tree):
+    return tree_map_tensor(lambda t: t.detach(), tree)
 
 def max_neg_value(t):
     return -torch.finfo(t.dtype).max
@@ -524,6 +537,251 @@ class Value(Module):
 
 # classes
 
+class Actor(Module):
+    def __init__(
+        self,
+        continuous_actions,
+        dim_action,
+        action_eps = 1e-5
+    ):
+        super().__init__()
+        self.continuous_actions = continuous_actions
+        self.dim_action = dim_action
+        if continuous_actions:
+            self.action_distr = BetaDistrReadout(source_range = (-1., 1.), eps = action_eps)
+
+    def compute_loss(self, action_preds, target_actions):
+        if self.continuous_actions:
+            neg_log_probs = self.action_distr(action_preds, target = target_actions)
+            return reduce(neg_log_probs, '... d -> ...', 'sum').mean()
+
+        return F.cross_entropy(
+            rearrange(action_preds, 'b ... c -> b c ...'),
+            target_actions
+        )
+
+    def sample_actions(
+        self,
+        action_preds,
+        temperature = 1.0,
+        return_log_prob = False
+    ):
+        if self.continuous_actions:
+            action = self.action_distr(action_preds, sample = True, temperature = temperature)
+
+            if not return_log_prob:
+                return action
+
+            log_probs = -self.action_distr(action_preds, target = action)
+            log_probs = reduce(log_probs, '... d -> ...', 'sum')
+            return action, log_probs
+
+        logits = safe_divide(action_preds, temperature)
+        dist = Categorical(logits = logits)
+        action = dist.sample()
+
+        if not return_log_prob:
+            return action
+
+        return action, dist.log_prob(action)
+
+    def get_action_preds(self, **kwargs):
+        raise NotImplementedError
+
+    def sample(
+        self,
+        temperature = 1.0,
+        return_log_prob = False,
+        **kwargs
+    ):
+        return_memories = kwargs.get('return_memories', False)
+        preds = self.get_action_preds(**kwargs)
+
+        next_memories = None
+        if return_memories:
+            preds, next_memories = preds
+
+        out = self.sample_actions(preds, temperature, return_log_prob)
+
+        if not return_memories:
+            return out
+
+        out = cast_tuple(out)
+        return (*out, next_memories)
+
+    def forward(self, target_actions = None, **kwargs):
+        preds = self.get_action_preds(**kwargs)
+
+        if not exists(target_actions):
+            return preds
+
+        return self.compute_loss(preds, target_actions)
+
+class ReflexiveActor(Actor):
+    def __init__(
+        self,
+        dim_state_latent,
+        dim_action,
+        continuous_actions,
+        hidden_dim = 256,
+        action_eps = 1e-5
+    ):
+        super().__init__(continuous_actions, dim_action, action_eps = action_eps)
+        dim_out = dim_action * 2 if continuous_actions else dim_action
+        self.net = MLP(dim_state_latent, hidden_dim, dim_out)
+
+    def get_action_preds(self, state_latents, return_memories = False, **kwargs):
+        pred = self.net(state_latents)
+
+        if not return_memories:
+            return pred
+
+        return pred, None
+
+class TransformerActor(Actor):
+    def __init__(
+        self,
+        dim,
+        dim_state_latent,
+        dim_action,
+        dim_transition_action_input,
+        continuous_actions,
+        model: Module,
+        num_sensory_views = 0,
+        pass_sensory_hiddens = False,
+        pass_world_model_hiddens = True,
+        dropout_all_but_state_latents = 0.,
+        action_eps = 1e-5
+    ):
+        super().__init__(
+            continuous_actions,
+            dim_action,
+            action_eps = action_eps
+        )
+
+        self.model = model
+
+        self.dim = dim
+        self.dim_action_input = dim_transition_action_input
+
+        self.state_encoder = MLP(dim_state_latent + dim, dim)
+        self.action_encoder = MLP(dim_transition_action_input + dim, dim)
+
+        dim_out = dim_action * 2 if continuous_actions else dim_action
+        self.to_action_pred = Sequential(RMSNorm(dim), LinearNoBias(dim, dim_out))
+
+        self.pass_sensory_hiddens = pass_sensory_hiddens
+
+        if pass_sensory_hiddens:
+            self.to_sensory_hiddens = ModuleList([LinearNoBias(dim, dim) for _ in range(num_sensory_views)])
+
+        self.pass_world_model_hiddens = pass_world_model_hiddens
+        self.dropout_all_but_state_latents = dropout_all_but_state_latents
+        self.has_dropout = dropout_all_but_state_latents > 0.
+
+    def get_action_preds(
+        self,
+        state_latents,
+        state_tokens = None,
+        action_cond = None,
+        action_tokens = None,
+        sensory_layer_hiddens = None,
+        world_model_hiddens = None,
+        memories = None,
+        return_memories = False,
+        **kwargs
+    ):
+        batch, seq_len = state_latents.shape[:2]
+
+        # condition dropout for unconditional seeding
+
+        if self.has_dropout and self.training:
+            if bernoulli(self.dropout_all_but_state_latents):
+                state_tokens = None
+                action_cond = None
+                action_tokens = None
+                sensory_layer_hiddens = None
+                world_model_hiddens = None
+
+        # handle absent states and actions
+
+        def default_zeros(t, feature_dim):
+            return state_latents.new_zeros(*state_latents.shape[:-1], feature_dim) if not exists(t) else t[:, :seq_len]
+
+        state_tokens = default_zeros(state_tokens, self.dim)
+
+        # project
+
+        actor_encoded_states = self.state_encoder(cat((state_tokens, state_latents), dim = -1))
+
+        if not exists(action_cond):
+            actor_tokens = actor_encoded_states
+        else:
+            action_cond = default_zeros(action_cond, self.dim_action_input)
+            action_tokens = default_zeros(action_tokens, self.dim)
+            actor_encoded_actions = self.action_encoder(cat((action_tokens, action_cond), dim = -1))
+
+            actor_tokens = rearrange([actor_encoded_states, actor_encoded_actions], 'sa b n d -> b (n sa) d')
+
+        # inject sensory hiddens and world model hiddens as past layers
+
+        actor_seq_len = actor_tokens.shape[1]
+
+        past_layers = []
+        past_layers_mask = []
+
+        has_actions = exists(action_cond)
+
+        if self.pass_sensory_hiddens and exists(sensory_layer_hiddens):
+            projected_sensory = [proj(h[:, :seq_len]) for proj, h in zip(self.to_sensory_hiddens, sensory_layer_hiddens)]
+
+            if has_actions:
+                sensory_past_layers = [rearrange([h, torch.zeros_like(h)], 'sa b n d -> b (n sa) d') for h in projected_sensory]
+                sensory_mask = tensor([True, False], device = state_latents.device)
+                sensory_mask = repeat(sensory_mask, 'sa -> b (n sa)', b = batch, n = seq_len)
+            else:
+                sensory_past_layers = projected_sensory
+                sensory_mask = torch.ones((batch, seq_len), dtype = torch.bool, device = state_latents.device)
+
+            past_layers.extend(sensory_past_layers)
+            past_layers_mask.extend([sensory_mask] * len(sensory_past_layers))
+
+        if self.pass_world_model_hiddens and exists(world_model_hiddens):
+            detached_hiddens = tree_map_tensor(lambda t: t[:, :actor_seq_len], world_model_hiddens)
+            past_layers.extend(detached_hiddens)
+
+            wm_masks = [torch.ones((batch, t.shape[1]), dtype = torch.bool, device = t.device) for t in detached_hiddens]
+            past_layers_mask.extend(wm_masks)
+
+        past_layers = tuple(past_layers) if not is_empty(past_layers) else None
+        past_layers_mask = tuple(past_layers_mask) if not is_empty(past_layers_mask) else None
+
+        # evaluate
+
+        actor_embed = self.model(
+            actor_tokens,
+            past_layers = past_layers,
+            past_layers_mask = past_layers_mask,
+            memories = memories,
+            return_memories = return_memories
+        )
+
+        next_memory = None
+        if return_memories:
+            actor_embed, next_memory = actor_embed
+
+        if actor_embed.shape[1] > seq_len:
+            actor_embed, _ = rearrange(actor_embed, 'b (n sa) d -> sa b n d', sa = 2)
+
+        pred = self.to_action_pred(actor_embed)
+
+        if not return_memories:
+            return pred
+
+        return pred, next_memory
+
+# agent / world model
+
 class WorldModel(Module):
     def __init__(
         self,
@@ -539,19 +797,23 @@ class WorldModel(Module):
         dim_state_latent = None,
         state_latent_clamp_value = 10.,
         ema_beta = 0.95,
+        actors: dict[str, Module] | None = None,
+        add_reflexive_actor = False,
+        add_transformer_actor = False,
         actor_model: Module | None = None,
         pass_world_model_hiddens_to_actor = True,
+        pass_sensory_hiddens_to_actor = False,
+        actor_dropout_all_but_state_latents = 0.,
+        actor_loss_weights: float | dict[str, float] = 1.,
         dim_action = None,
         continuous_actions = True,
         action_eps = 1e-5,
         action_recon_loss_weight = 1.,
         next_encoded_state_pred_loss_weight = 1.,
         plan_state_pred_loss_weight = 1.,
-        actor_loss_weight = 1.,
         value_loss_weight = 1.,
         discount_factor = 0.99,
         pass_sensory_hiddens_to_world_model = False,
-        pass_sensory_hiddens_to_actor = False,
         frac_gradients = 0.,
         reg_next_state_weight = 0.,
         reg_next_encoded_weight = 0.,
@@ -591,6 +853,7 @@ class WorldModel(Module):
         self.dim_state_latent = dim_state_latent
         self.dim_action_latent = dim_action_latent
         self.state_latent_clamp_value = state_latent_clamp_value
+        self.has_state_latent_clamp = state_latent_clamp_value > 0.
 
         # handle state encoders
         # which could have multiple states, and each could have multiple views (ie. eyes, ears)
@@ -608,7 +871,7 @@ class WorldModel(Module):
 
         self.view_embs = nn.ParameterList([SmallInitEmbed((v, dim)) if v > 1 else None for v in self.num_sensory_views])
 
-        if pass_sensory_hiddens_to_world_model or pass_sensory_hiddens_to_actor:
+        if pass_sensory_hiddens_to_world_model:
             assert len(self.state_encoder) > 1, 'passing sensory layers to attention residual requires more than one modality'
 
         self.action_encoder = action_encoder
@@ -628,11 +891,7 @@ class WorldModel(Module):
             dim_transition_action_input = dim_action
             need_learned_action_decoder = False
 
-        elif transition_action_space == 'local':  # encoded, but no context
-            dim_transition_action_input = dim_action_latent
-            need_learned_action_decoder = True
-
-        elif transition_action_space == 'global': # sees past actions
+        elif transition_action_space in ('local', 'global'):
             dim_transition_action_input = dim_action_latent
             need_learned_action_decoder = True
 
@@ -653,7 +912,7 @@ class WorldModel(Module):
         self.probabilistic_plan_state_transition = probabilistic_plan_state_transition
 
         if probabilistic_state_transition or probabilistic_plan_state_transition:
-            assert state_latent_clamp_value > 0., 'state_latent_clamp_value must be greater than 0 if either probabilistic state transition is turned on'
+            assert self.has_state_latent_clamp, 'state_latent_clamp_value must be greater than 0 if either probabilistic state transition is turned on'
 
         if probabilistic_state_transition:
             self.state_transition_beta_distr = BetaDistrReadout(source_range = (-state_latent_clamp_value, state_latent_clamp_value), eps = state_transition_eps)
@@ -704,38 +963,49 @@ class WorldModel(Module):
         self.ema_state_transition = EMA(state_transition, beta = ema_beta)
         self.ema_state_transition_for_planning = EMA(self.state_transition_for_planning, beta = ema_beta)
 
-        # actor / behavior clone
+        # actors
 
-        self.actor_state_encoder = MLP(dim_state_latent + dim, dim)
-        self.actor_action_encoder = MLP(dim_transition_action_input + dim, dim)
+        actors = dict(default(actors, dict()))
 
-        if exists(actor_model):
-            if not isinstance(actor_model, (list, tuple, ModuleList)):
-                actor_model = [actor_model]
+        if add_reflexive_actor:
+            actors['reflexive'] = ReflexiveActor(
+                dim_state_latent = dim_state_latent,
+                dim_action = dim_action,
+                continuous_actions = continuous_actions,
+                action_eps = action_eps
+            )
 
-            actor_model = ModuleList(actor_model)
+        if add_transformer_actor:
+            assert exists(actor_model), 'actor_model must be provided if add_transformer_actor is True'
 
-        self.actor_models = actor_model
-        self.pass_world_model_hiddens_to_actor = pass_world_model_hiddens_to_actor
+            num_views = len(self.state_encoder)
+
+            actors['transformer'] = TransformerActor(
+                dim = dim_state_latent,
+                dim_state_latent = dim_state_latent,
+                dim_action = dim_action,
+                dim_transition_action_input = dim_action_latent if transition_action_space != 'raw' else dim_action,
+                continuous_actions = continuous_actions,
+                model = actor_model,
+                num_sensory_views = num_views,
+                pass_sensory_hiddens = pass_sensory_hiddens_to_actor,
+                pass_world_model_hiddens = pass_world_model_hiddens_to_actor,
+                dropout_all_but_state_latents = actor_dropout_all_but_state_latents,
+                action_eps = action_eps
+            )
+
+        self.actors = ModuleDict(actors)
+        self.has_actors = len(actors) > 0
+
+        if not isinstance(actor_loss_weights, dict):
+            actor_loss_weights = {name: actor_loss_weights for name in actors}
+
+        self.actor_loss_weights = actor_loss_weights
+
         self.pass_sensory_hiddens_to_world_model = pass_sensory_hiddens_to_world_model
-        self.pass_sensory_hiddens_to_actor = pass_sensory_hiddens_to_actor
-
-        self.to_next_action_preds = None
-
-        self.has_actor = exists(actor_model) and exists(dim_action) and actor_loss_weight > 0.
-
-        if self.has_actor:
-            if self.pass_sensory_hiddens_to_actor:
-                self.to_actor_sensory_hiddens = ModuleList([LinearNoBias(dim, dim) for _ in self.state_encoder])
-
-            dim_action_param = (dim_action * 2) if continuous_actions else dim_action
-            self.to_next_action_preds = ModuleList([Sequential(RMSNorm(dim), LinearNoBias(dim, dim_action_param)) for _ in self.actor_models])
 
         self.continuous_actions = continuous_actions
         self.action_eps = action_eps
-
-        if self.continuous_actions:
-            self.action_beta_distr = BetaDistrReadout(source_range = (-1., 1.), eps = action_eps)
 
         # value head
 
@@ -748,7 +1018,7 @@ class WorldModel(Module):
         self.plan_state_pred_loss_weight = plan_state_pred_loss_weight
 
         self.action_recon_loss_weight = action_recon_loss_weight
-        self.actor_loss_weight = actor_loss_weight
+
         self.value_loss_weight = value_loss_weight
 
         self.action_latent_wasserstein_loss_weight = action_latent_wasserstein_loss_weight
@@ -895,6 +1165,8 @@ class WorldModel(Module):
         cem_ema_decay = 1.,
         cem_min_var = 1e-5,
         cem_temperature = 0.,
+        seed_with_actor: str | None = None,
+        actor_temperature = 1.,
         clamp_state_latent_to_range = True,
         return_action_latent = False,
         search_space: Literal['raw', 'local_global'] | None = None,
@@ -942,6 +1214,8 @@ class WorldModel(Module):
         if exists(memories):
             state_rnn_memories, action_rnn_memories, model_memories = memories
 
+        next_model_memories = dict()
+
         # linear rnns for contextualizing states and actions separately
 
         rnn_state_tokens, next_state_rnn_memories = self.state_linear_rnn(
@@ -979,22 +1253,106 @@ class WorldModel(Module):
 
         means = torch.rand(shape, device = device) * 2. - 1.
         stds = torch.rand(shape, device = device)
-        variances = (stds ** 2).clamp_min(cem_min_var)
-
-        # precompute past rnn memories for rnn action latents, repeating to population size
+        variances = (stds ** 2).clamp_min(cem_min_var)        # precompute past rnn memories for rnn action latents, repeating to population size
 
         past_rnn_memories = tree_map_tensor(partial(batch_repeat, r = pop_size), next_action_rnn_memories)
+
+        # helper for encoding a single action step
+
+        def encode_action_step(action, memories):
+            if not (is_search_space_raw_action and not self.is_transition_action_space_raw):
+                return action, memories
+
+            action, unpack = pack_with_inverse(action, '* d')
+            encoded = self.action_encoder(action)
+
+            if self.transition_action_space == 'global':
+                encoded, memories = self.action_linear_rnn(
+                    rearrange(encoded, '... d -> ... 1 d'),
+                    memories = memories,
+                    return_memories = True
+                )
+                encoded = rearrange(encoded, '... 1 d -> ... d')
+
+            return unpack(self.to_action_latent(encoded)), memories
+
+        # helper for advancing state
+
+        def advance_state(state, action, return_entropy = False):
+            logits = self.ema_state_transition_for_planning((state, action))
+
+            if self.probabilistic_plan_state_transition:
+                return self.plan_state_transition_beta_distr(logits, sample = True, return_entropy = return_entropy)
+
+            next_state = state + logits
+
+            if clamp_state_latent_to_range and self.has_state_latent_clamp:
+                next_state.clamp_(-self.state_latent_clamp_value, self.state_latent_clamp_value)
+
+            return (next_state, None) if return_entropy else next_state
+
+        # actor seeding logic
+
+        seed_actor = None
+        if exists(seed_with_actor) and self.has_actors and seed_with_actor in self.actors:
+            seed_actor = self.actors[seed_with_actor]
+
+        if exists(seed_actor):
+            step_state, step_rnn_memories = state_latents, past_rnn_memories
+            seeded_actions = []
+            seed_actor_memory = None
+            seed_last_action_cond = None
+            seed_last_action_tokens = None
+
+            for _ in range(horizon):
+                step_state_reshaped, unpack_actor = pack_with_inverse(step_state, '* d')
+                step_state_reshaped = rearrange(step_state_reshaped, 'b d -> b 1 d')
+
+                action_kwargs = dict(
+                    state_latents = step_state_reshaped,
+                    temperature = actor_temperature,
+                    memories = seed_actor_memory,
+                    return_memories = True
+                )
+
+                if exists(seed_last_action_cond):
+                    action_kwargs.update(
+                        action_cond = seed_last_action_cond,
+                        action_tokens = seed_last_action_tokens
+                    )
+
+                step_action, seed_actor_memory = seed_actor.sample(**action_kwargs)
+
+                step_action_seq = rearrange(step_action, 'b ... -> b 1 ...')
+                seed_last_action_tokens = self.action_encoder(step_action_seq)
+                if self.is_transition_action_space_raw:
+                    seed_last_action_cond = step_action_seq
+                else:
+                    seed_last_action_cond = self.to_action_latent(seed_last_action_tokens)
+
+                step_action = rearrange(step_action, 'b 1 ... -> b ...')
+                step_action = unpack_actor(step_action)
+
+                step_action_cond, step_rnn_memories = encode_action_step(step_action, step_rnn_memories)
+
+                seeded_actions.append(step_action if is_search_space_raw_action else step_action_cond)
+                step_state = advance_state(step_state, step_action_cond)
+
+            seeded_actions = stack(seeded_actions, dim = 2)
 
         # iterate
 
         for generation in range(generations):
+            is_first = generation == 0
             is_last = generation == generations - 1
 
             # instantiate population
 
-            # actions could be in raw, encoded, or contextualized latent space
+            if is_first and exists(seed_actor):
+                actions = seeded_actions
+            else:
+                actions = means + variances.sqrt() * torch.randn((batch, pop_size, horizon, dim_action), device = device)
 
-            actions = means + variances.sqrt() * torch.randn((batch, pop_size, horizon, dim_action), device = device)
             actions.clamp_(-1., 1.)
 
             # the action condition into the step
@@ -1036,20 +1394,10 @@ class WorldModel(Module):
 
                 # state transition
 
-                if self.probabilistic_plan_state_transition:
-                    pred_next_state_logits = self.ema_state_transition_for_planning((step_state_latents, step_action_cond))
-                    step_state_latents, step_entropy = self.plan_state_transition_beta_distr(
-                        pred_next_state_logits,
-                        sample = True,
-                        return_entropy = True
-                    )
-                    pred_state_entropies.append(step_entropy)
-                else:
-                    pred_next_state_latent_residual = self.ema_state_transition_for_planning((step_state_latents, step_action_cond))
-                    step_state_latents = step_state_latents + pred_next_state_latent_residual
+                step_state_latents, step_entropy = advance_state(step_state_latents, step_action_cond, return_entropy = True)
 
-                    if clamp_state_latent_to_range and exists(self.state_latent_clamp_value) and self.state_latent_clamp_value > 0.:
-                        step_state_latents.clamp_(-self.state_latent_clamp_value, self.state_latent_clamp_value)
+                if exists(step_entropy):
+                    pred_state_entropies.append(step_entropy)
 
                 pred_state_latents.append(step_state_latents)
 
@@ -1174,11 +1522,13 @@ class WorldModel(Module):
         fitness_fn = None,
         goal_state = None,
         return_cpu = True,
+        actor_module: str | None = None, # can be any custom key, but 'reflexive' or 'bc' are standard
+        actor_temperature = 1.0,
         **plan_kwargs
     ):
         env = EnvWrapper(env, return_cpu = return_cpu)
 
-        states, actions, rewards, terminateds, truncateds, infos = [], [], [], [], [], []
+        states, actions, actor_log_probs, rewards, terminateds, truncateds, infos = [], [], [], [], [], [], []
 
         state, info = env.reset()
 
@@ -1201,21 +1551,42 @@ class WorldModel(Module):
             state = tree_map_tensor_to_device(state, self.device)
 
             # single timestep
+
             state_seq = tree_map_tensor(lambda t: rearrange(t, 'b ... -> b 1 ...'), state)
 
-            planned_actions, memories = self.plan(
-                states = state_seq,
-                actions = empty_actions,
-                fitness_fn = fitness_fn,
-                goal_state = goal_state,
-                memories = memories,
-                return_memories = True,
-                **plan_kwargs
-            )
+            if exists(actor_module):
+                # encode state
+                ema_encoded_state, ema_encoded_sensory_states, patch_mask = self.encode_states(self.ema_state_encoder, state_seq)
+                ema_state_tokens = rearrange(ema_encoded_state, 'b 1 ... -> b ...')
+                ema_state_latents = self.to_state_latent(ema_state_tokens)
 
-            # pick the first action for now
+                actor = self.actors[actor_module]
 
-            action = planned_actions[:, 0]
+                action, step_log_prob = actor.sample(
+                    state_latents = ema_state_latents,
+                    state_tokens = ema_state_tokens,
+                    sensory_layer_hiddens = ema_encoded_sensory_states,
+                    temperature = actor_temperature,
+                    return_log_prob = True
+                )
+
+                action = rearrange(action, 'b 1 ... -> b ...')
+                step_log_prob = rearrange(step_log_prob, 'b 1 -> b')
+
+                actor_log_probs.append(step_log_prob.cpu() if return_cpu else step_log_prob)
+                memories = None
+            else:
+                planned_actions, memories = self.plan(
+                    states = state_seq,
+                    actions = empty_actions,
+                    fitness_fn = fitness_fn,
+                    goal_state = goal_state,
+                    memories = memories,
+                    return_memories = True,
+                    **plan_kwargs
+                )
+                action = planned_actions[:, 0]
+
             actions.append(action.cpu() if return_cpu else action)
 
             next_state, reward, terminated, truncated, info = env.step(action)
@@ -1271,7 +1642,10 @@ class WorldModel(Module):
         batch_discount = self.value_network.discount_factor.expand(batch)
         returns = (batch_discount, returns)
 
-        experience = (states, actions, rewards, terminateds, truncateds, infos, episode_len, cumulative_rewards, returns)
+        actor_log_probs = actor_log_probs if not is_empty(actor_log_probs) else None
+        actor_log_probs = maybe(stack)(actor_log_probs, dim = 1)
+
+        experience = (states, actions, actor_log_probs, rewards, terminateds, truncateds, infos, episode_len, cumulative_rewards, returns)
 
         if return_cpu:
             experience = tree_map_tensor_to_device(experience, 'cpu')
@@ -1283,7 +1657,7 @@ class WorldModel(Module):
         states: States,
         actions,
         returns = None,
-        behavior_clone = True,
+        behavior_clone: bool | str | tuple[str, ...] | list[str] = True,
         return_loss = True,
         memories = None,
         return_memories = False
@@ -1304,7 +1678,7 @@ class WorldModel(Module):
         if exists(memories):
             state_rnn_memories, action_rnn_memories, model_memories = memories
 
-        # handle last action not being given
+        next_model_memories = dict()
 
         # encode the states and actions, todo: do mixture of transformers, a la VLAs
 
@@ -1520,64 +1894,49 @@ class WorldModel(Module):
 
         next_encoded_state_pred_loss = F.smooth_l1_loss(pred_next_encoded_state, next_ema_encoded_state_target.detach())
 
-        # maybe behavior clone
+        # behavior clone
 
-        actor_loss = self.zero
+        actor_bc_loss = self.zero
+        actor_losses = dict()
 
-        if self.has_actor and behavior_clone:
-            actor_encoded_states = self.actor_state_encoder(cat((state_tokens[:, :-1], state_latents.detach()), dim = -1))
-            actor_encoded_actions = self.actor_action_encoder(cat((action_tokens[:, :action_cond.shape[1]], action_cond.detach()), dim = -1))
+        if self.has_actors and behavior_clone:
 
-            actor_tokens = rearrange([actor_encoded_states, actor_encoded_actions], 'sa b n d -> b (n sa) d')
+            if isinstance(behavior_clone, str):
+                behavior_clone_actors = [behavior_clone]
+            elif isinstance(behavior_clone, (tuple, list)):
+                behavior_clone_actors = behavior_clone
+            else:
+                behavior_clone_actors = list(self.actors.keys())
 
-            actor_past_layers = []
-            actor_past_layers_mask = []
+            bc_seq_len = state_tokens.shape[1] - 1
 
-            if self.pass_sensory_hiddens_to_actor:
-                projected_sensory = [proj(h[:, :-1].detach()) for proj, h in zip(self.to_actor_sensory_hiddens, sensory_layer_hiddens)]
-                actor_sensory_hiddens = [rearrange([h, torch.zeros_like(h)], 'sa b n d -> b (n sa) d') for h in projected_sensory]
-                actor_past_layers.extend(actor_sensory_hiddens)
+            for name, actor in self.actors.items():
+                if name not in behavior_clone_actors:
+                    continue
 
-                sensory_mask = tensor([True, False], device = device)
-                sensory_mask = repeat(sensory_mask, 'sa -> b (n sa)', b = batch, n = state_len - 1)
-                actor_past_layers_mask.extend([sensory_mask] * len(actor_sensory_hiddens))
+                loss_weight = self.actor_loss_weights[name]
 
-            if self.pass_world_model_hiddens_to_actor:
-                seq_len = actor_tokens.shape[1]
-                detached_hiddens = tree_map_tensor(lambda t: t[:, :seq_len].detach(), world_model_hiddens)
-                actor_past_layers.extend(detached_hiddens)
+                if loss_weight == 0.:
+                    continue
 
-                wm_mask = torch.ones((batch, seq_len), dtype = torch.bool, device = device)
-                actor_past_layers_mask.extend([wm_mask] * len(detached_hiddens))
+                actor_bc_loss_for_name = actor(
+                    target_actions = orig_actions[:, :bc_seq_len],
+                    state_latents = tree_map_detach(state_latents),
+                    state_tokens = tree_map_detach(state_tokens),
+                    action_cond = tree_map_detach(action_cond),
+                    action_tokens = tree_map_detach(action_tokens),
+                    sensory_layer_hiddens = tree_map_detach(sensory_layer_hiddens) if exists(sensory_layer_hiddens) else None,
+                    world_model_hiddens = tree_map_detach(world_model_hiddens) if exists(world_model_hiddens) else None,
+                    memories = model_memories[name] if exists(model_memories) and name in model_memories else None,
+                    return_memories = return_memories
+                )
 
-            actor_past_layers = tuple(actor_past_layers) if not is_empty(actor_past_layers) else None
-            actor_past_layers_mask = tuple(actor_past_layers_mask) if not is_empty(actor_past_layers_mask) else None
+                if return_memories:
+                    actor_bc_loss_for_name, next_actor_memory = actor_bc_loss_for_name
+                    next_model_memories[name] = next_actor_memory
 
-            actor_losses = []
-
-            for actor_model, to_next_action_pred in zip(self.actor_models, self.to_next_action_preds):
-                actor_embed = actor_model(actor_tokens, past_layers = actor_past_layers, past_layers_mask = actor_past_layers_mask)
-
-                actor_state_embed, _ = rearrange(actor_embed, 'b (n sa) d -> sa b n d', sa = 2)
-
-                next_action_pred = to_next_action_pred(actor_state_embed)
-
-                # log probs
-
-                next_actions = orig_actions[:, :next_action_pred.shape[1]]
-
-                if self.continuous_actions:
-                    # use unimodal beta
-
-                    neg_log_probs = self.action_beta_distr(next_action_pred, target = next_actions)
-                    loss = neg_log_probs.sum(dim = -1).mean()
-
-                else:
-                    loss = F.cross_entropy(rearrange(next_action_pred, 'b n c -> b c n'), next_actions)
-
-                actor_losses.append(loss)
-
-            actor_loss = sum(actor_losses)
+                actor_losses[name] = actor_bc_loss_for_name
+                actor_bc_loss = actor_bc_loss + actor_bc_loss_for_name * loss_weight
 
         # value head
 
@@ -1659,7 +2018,8 @@ class WorldModel(Module):
             plan_state_pred_loss,
             action_recon_loss,
             next_encoded_state_pred_loss,
-            actor_loss,
+            actor_bc_loss,
+            actor_losses,
             value_loss,
             reg_next_state_loss,
             reg_next_encoded_loss,
@@ -1680,7 +2040,7 @@ class WorldModel(Module):
             plan_state_pred_loss * self.plan_state_pred_loss_weight +
             action_recon_loss * self.action_recon_loss_weight +
             next_encoded_state_pred_loss * self.next_encoded_state_pred_loss_weight +
-            actor_loss * self.actor_loss_weight +
+            actor_bc_loss +
             value_loss * self.value_loss_weight +
             reg_next_state_loss * self.reg_next_state_weight +
             reg_next_encoded_loss * self.reg_next_encoded_weight +

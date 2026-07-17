@@ -10,7 +10,8 @@ from einops.layers.torch import Rearrange
 
 from x_mlps_pytorch import MLP
 
-from x_jepa.x_jepa import WorldModel, Transformer, exists
+from x_jepa.x_jepa import WorldModel, Transformer, Actor, exists
+from x_jepa.min_gru import minGRUBlocks
 from x_jepa.regularizers import SigReg, VISReg, uniform_wasserstein_loss
 from x_jepa.goals import FlowMatching, GoalGenerator
 
@@ -159,7 +160,9 @@ def test_behavior_cloning(
     transition_action_space,
     pass_world_model_hiddens_to_actor
 ):
-    if transition_action_space == 'raw' and not continuous_actions:
+    transition_action_is_raw = transition_action_space == 'raw'
+
+    if transition_action_is_raw and not continuous_actions:
         pytest.skip('raw state transition action space requires continuous actions')
 
     model = Transformer(
@@ -175,19 +178,21 @@ def test_behavior_cloning(
     )
 
     dim_action = 20 if continuous_actions else 4
+    dim_action_latent = 32
 
     world_model = WorldModel(
         state_encoder = nn.Linear(128, 512),
         action_encoder = nn.Linear(dim_action, 512) if continuous_actions else nn.Embedding(dim_action, 512),
-        action_decoder = nn.Linear(32, dim_action) if transition_action_space != 'raw' else None,
+        action_decoder = None if transition_action_is_raw else nn.Linear(dim_action_latent, dim_action),
         transition_action_space = transition_action_space,
-        dim_action_latent = 32,
+        dim_action_latent = dim_action_latent,
         model = model,
+        add_transformer_actor = True,
         actor_model = actor_model,
         pass_world_model_hiddens_to_actor = pass_world_model_hiddens_to_actor,
         dim_action = dim_action,
         continuous_actions = continuous_actions,
-        actor_loss_weight = 1.
+        actor_loss_weights = 1.
     )
 
     states = torch.randn(2, 10, 128)
@@ -464,7 +469,6 @@ def test_multimodal(complex_sensory):
     model = Transformer(dim = 256, depth = 2)
 
     actor_model = Transformer(dim = 256, depth = 2)
-
     if complex_sensory:
         state_encoders = [image_encoder, image_encoder, vector_encoder, vector_encoder]
     else:
@@ -475,9 +479,9 @@ def test_multimodal(complex_sensory):
         action_encoder = nn.Linear(64, 256),
         model = model,
         dim_action = 64,
+        add_transformer_actor = True,
         actor_model = actor_model,
-        pass_sensory_hiddens_to_world_model = True,
-        pass_sensory_hiddens_to_actor = True
+        pass_sensory_hiddens_to_world_model = True
     )
 
     if complex_sensory:
@@ -663,3 +667,179 @@ def test_world_model_with_intrinsics():
     )
 
     assert planned_actions.shape == (2, 3, 4)
+
+def test_reflexive_actor_and_planning():
+    dim = 128
+    dim_action = 4
+    model = Transformer(
+        dim = dim,
+        depth = 2,
+        causal = True
+    )
+
+    world_model = WorldModel(
+        model = model,
+        dim_action = dim_action,
+        state_encoder = nn.Linear(64, dim),
+        action_encoder = nn.Linear(dim_action, dim),
+        action_decoder = nn.Linear(dim, dim_action),
+        transition_action_space = 'local',
+        continuous_actions = True,
+        add_reflexive_actor = True,
+        actor_loss_weights = 1.
+    )
+
+    world_model.eval()
+
+    states = torch.randn(2, 5, 64)
+    actions = torch.randn(2, 4, dim_action)
+
+    # Test forward pass with reflexive actor loss
+    loss, loss_breakdown = world_model(states, actions, behavior_clone = True)
+    assert loss.dim() == 0
+    assert loss_breakdown.actor_losses['reflexive'] > 0.
+
+    def fitness_fn(pred_state_latents):
+        return torch.randn(pred_state_latents.shape[:2])
+
+    planned_actions = world_model.plan(
+        states = states[:, :1],
+        actions = torch.empty(2, 0, dim_action),
+        fitness_fn = fitness_fn,
+        horizon = 3,
+        pop_size = 4,
+        generations = 2,
+        seed_with_actor = 'reflexive',
+        actor_temperature = 0.5
+    )
+
+    assert planned_actions.shape == (2, 3, dim_action)
+
+def test_transformer_actor_sequential_vs_parallel():
+    dim = 128
+    dim_action = 4
+
+    world_model = WorldModel(
+        model = Transformer(dim = dim, depth = 2, causal = True),
+        dim_action = dim_action,
+        state_encoder = nn.Linear(64, dim),
+        action_encoder = nn.Linear(dim_action, dim),
+        action_decoder = nn.Linear(dim, dim_action),
+        transition_action_space = 'local',
+        continuous_actions = True,
+        add_transformer_actor = True,
+        actor_model = Transformer(dim = dim, depth = 2, causal = True),
+        pass_world_model_hiddens_to_actor = False,
+        actor_loss_weights = 1.
+    )
+
+    world_model.eval()
+
+    transformer_actor = world_model.actors['transformer']
+
+    states = torch.randn(2, 5, 64)
+    actions = torch.randn(2, 4, dim_action)
+
+    state_tokens, _, _ = world_model.encode_states(world_model.state_encoder, states)
+    state_latents = world_model.to_state_latent(state_tokens)
+
+    action_tokens = world_model.action_encoder(actions)
+    action_cond = world_model.to_action_latent(action_tokens)
+
+    # parallel forward - states and actions must have matching seq len for interleaving
+
+    num_steps = actions.shape[1]
+
+    parallel_preds, parallel_memories = transformer_actor.get_action_preds(
+        state_latents = state_latents[:, :num_steps],
+        state_tokens = state_tokens[:, :num_steps],
+        action_cond = action_cond,
+        action_tokens = action_tokens,
+        return_memories = True
+    )
+
+    # sequential forward
+
+    sequential_preds = []
+    memories = None
+
+    for i in range(num_steps):
+        step_preds, memories = transformer_actor.get_action_preds(
+            state_latents = state_latents[:, i:i + 1],
+            state_tokens = state_tokens[:, i:i + 1],
+            action_cond = action_cond[:, i:i + 1],
+            action_tokens = action_tokens[:, i:i + 1],
+            memories = memories,
+            return_memories = True
+        )
+
+        sequential_preds.append(step_preds[:, 0])
+
+    sequential_preds = torch.stack(sequential_preds, dim = 1)
+
+    assert torch.allclose(parallel_preds, sequential_preds, atol = 1e-4)
+
+class MinGRUActor(Actor):
+    def __init__(self, dim_state_latent, dim_action, continuous_actions, depth = 2, action_eps = 1e-5):
+        super().__init__(continuous_actions, dim_action, action_eps = action_eps)
+        dim_out = dim_action * 2 if continuous_actions else dim_action
+        self.gru = minGRUBlocks(dim = dim_state_latent, depth = depth)
+        self.to_action_pred = nn.Linear(dim_state_latent, dim_out)
+
+    def get_action_preds(self, state_latents, memories = None, return_memories = False, **kwargs):
+        out, next_memories = self.gru(state_latents, memories = memories, return_memories = True)
+        pred = self.to_action_pred(out)
+
+        if not return_memories:
+            return pred
+
+        return pred, next_memories
+
+def test_custom_mingru_actor():
+    dim = 128
+    dim_action = 4
+
+    mingru_actor = MinGRUActor(
+        dim_state_latent = dim,
+        dim_action = dim_action,
+        continuous_actions = True,
+        depth = 2
+    )
+
+    world_model = WorldModel(
+        model = Transformer(dim = dim, depth = 2, causal = True),
+        dim_action = dim_action,
+        state_encoder = nn.Linear(64, dim),
+        action_encoder = nn.Linear(dim_action, dim),
+        action_decoder = nn.Linear(dim, dim_action),
+        transition_action_space = 'local',
+        continuous_actions = True,
+        actors = dict(mingru = mingru_actor),
+        actor_loss_weights = 1.
+    )
+
+    states = torch.randn(2, 5, 64)
+    actions = torch.randn(2, 4, dim_action)
+
+    # behavior clone
+
+    loss, loss_breakdown = world_model(states, actions, behavior_clone = 'mingru')
+    assert loss.dim() == 0
+    assert loss_breakdown.actor_losses['mingru'] > 0.
+
+    # planning
+
+    world_model.eval()
+
+    planned_actions = world_model.plan(
+        states = states[:, :1],
+        actions = torch.empty(2, 0, dim_action),
+        fitness_fn = lambda pred_state_latents: torch.randn(pred_state_latents.shape[:2]),
+        horizon = 3,
+        pop_size = 4,
+        generations = 2,
+        seed_with_actor = 'mingru',
+        actor_temperature = 0.5
+    )
+
+    assert planned_actions.shape == (2, 3, dim_action)

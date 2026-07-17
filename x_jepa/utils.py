@@ -11,7 +11,18 @@ from torch_einops_utils import tree_map_tensor
 
 # constants
 
-Experience = namedtuple('Experience', ['states', 'actions', 'rewards', 'terminated', 'truncated', 'infos', 'episode_len', 'cumulative_rewards', 'returns'])
+Experience = namedtuple('Experience', [
+    'states',
+    'actions',
+    'actor_log_probs',
+    'rewards',
+    'terminated',
+    'truncated',
+    'infos',
+    'episode_len',
+    'cumulative_rewards',
+    'returns'
+])
 
 # helper functions
 
