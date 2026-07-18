@@ -88,6 +88,9 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def divisible_by(num, den):
+    return (num % den) == 0
+
 def identity(t):
     return t
 
@@ -260,13 +263,30 @@ class Attention(Module):
 class AttentionResidual(Module):
     def __init__(
         self,
-        dim
+        dim,
+        use_pseudo_queries = False,
+        dim_head = None
     ):
         super().__init__()
-        self.scale = dim ** -0.5
+        self.use_pseudo_queries = use_pseudo_queries
 
-        self.to_query = LinearNoBias(dim, dim)
         self.norm_keys = RMSNorm(dim)
+
+        dim_head = default(dim_head, dim)
+        self.scale = dim_head ** -0.5
+
+        assert divisible_by(dim, dim_head), f'dimension {dim} must be divisible by dim_head {dim_head}'
+        heads = dim // dim_head
+
+        self.split_heads = Rearrange('l m (h d) -> h l m d', h = heads)
+        self.merge_heads = Rearrange('h m d -> m (h d)')
+
+        if use_pseudo_queries:
+            self.pseudo_queries = nn.Parameter(torch.zeros(heads, dim_head))
+            nn.init.normal_(self.pseudo_queries, std = 0.02)
+        else:
+            self.to_query = LinearNoBias(dim, dim)
+            self.split_queries_heads = Rearrange('m (h d) -> h m d', h = heads)
 
     def forward(
         self,
@@ -278,30 +298,40 @@ class AttentionResidual(Module):
 
         hiddens, unpack = pack_with_inverse(hiddens, 'l * d')
 
-        *_, last_layer_output = hiddens
-
         # cross attention
 
-        queries = self.to_query(last_layer_output)
-        keys = self.norm_keys(hiddens)
         values = hiddens
+        keys = self.norm_keys(values)
 
-        sim = einsum(queries, keys, 'm d, l m d -> m l') * self.scale
+        keys, values = self.split_heads(keys), self.split_heads(values)
+
+        # queries and similarities
+
+        if self.use_pseudo_queries:
+            sim = einsum(self.pseudo_queries, keys, 'h d, h l m d -> h m l') * self.scale
+        else:
+            *_, last_layer_output = hiddens
+            queries = self.split_queries_heads(self.to_query(last_layer_output))
+            sim = einsum(queries, keys, 'h m d, h l m d -> h m l') * self.scale
+
+        # masking
 
         if exists(mask):
-            if isinstance(mask, (list, tuple)):
-                mask = stack(mask)
+            mask = stack(mask) if isinstance(mask, (list, tuple)) else mask
 
             mask, _ = pack_with_inverse(mask, 'l *')
             mask = rearrange(mask, 'l m -> m l')
 
             mask = pad_right_at_dim_to(mask, sim.shape[-1], value = True)
 
-            sim = sim.masked_fill(~mask, max_neg_value(sim))
+            sim = einx.where('m l, h m l, -> h m l', mask, sim, max_neg_value(sim))
+
+        # attention and aggregate
 
         attn = sim.softmax(dim = -1)
 
-        out = einsum(attn, values, 'm l, l m d -> m d')
+        out = einsum(attn, values, 'h m l, h l m d -> h m d')
+        out = self.merge_heads(out)
 
         return unpack(out, '* d')
 
@@ -356,7 +386,9 @@ class Transformer(Module):
         dim_head = 64,
         heads = 8,
         ff_expand_factor = 4.,
-        use_pope = False
+        use_pope = False,
+        use_pseudo_queries = False,
+        attn_res_dim_head = None
     ):
         super().__init__()
         self.dim = dim
@@ -370,7 +402,7 @@ class Transformer(Module):
 
         for _ in range(depth):
             attn = Attention(dim = dim, dim_head = dim_head, heads = heads, causal = causal)
-            attn_res = AttentionResidual(dim = dim)
+            attn_res = AttentionResidual(dim = dim, use_pseudo_queries = use_pseudo_queries, dim_head = attn_res_dim_head)
             ff = SwiGLUFeedForward(dim = dim, expand_factor = ff_expand_factor)
 
             layers.append(ModuleList([attn_res, attn, ff]))

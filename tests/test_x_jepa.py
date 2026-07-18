@@ -287,12 +287,16 @@ def test_goal_flow_match():
     assert sampled_goals.shape == (batch_size, dim)
 
 @param('use_pope', (False, True))
-def test_transformer(use_pope):
+@param('use_pseudo_queries', (False, True))
+@param('attn_res_dim_head', (1, 64, 512))
+def test_transformer(use_pope, use_pseudo_queries, attn_res_dim_head):
     model = Transformer(
         dim = 512,
         depth = 2,
         causal = True,
-        use_pope = use_pope
+        use_pope = use_pope,
+        use_pseudo_queries = use_pseudo_queries,
+        attn_res_dim_head = attn_res_dim_head
     )
 
     tokens = torch.randn(2, 10, 512)
