@@ -10,7 +10,7 @@ from einops.layers.torch import Rearrange
 
 from x_mlps_pytorch import MLP
 
-from x_jepa.x_jepa import WorldModel, Transformer, Actor, exists
+from x_jepa.x_jepa import WorldModel, Transformer, Actor, exists, WorldModelRolloutWrapper, TTTMetaLearningLoss
 from x_jepa.min_gru import minGRUBlocks
 from x_jepa.regularizers import SigReg, VISReg, uniform_wasserstein_loss
 from x_jepa.goals import FlowMatching, GoalGenerator
@@ -81,7 +81,7 @@ def test_world_model(
         goal_state = torch.randn(2, 128)
 
         def custom_fitness_fn(pred_values, pred_next_encoded_states, encoded_goal):
-            dist = torch.nn.functional.mse_loss(pred_next_encoded_states, encoded_goal, reduction = 'none')
+            dist = torch.nn.functional.mse_loss(pred_next_encoded_states, encoded_goal.expand_as(pred_next_encoded_states), reduction = 'none')
             dist = reduce(dist, 'b p h d -> b p', 'sum')
             values = reduce(pred_values, 'b p h -> b p', 'sum')
             return values - dist
@@ -655,7 +655,7 @@ def test_world_model_with_intrinsics():
     # Test planning pass with intrinsic bonus dependency injection
     def fitness_fn(pred_intrinsic_bonuses):
         bonus = pred_intrinsic_bonuses[0]
-        return bonus.sum(dim=-1)
+        return bonus.sum(dim = -1)
 
     planned_actions = world_model.plan(
         states,
@@ -843,3 +843,93 @@ def test_custom_mingru_actor():
     )
 
     assert planned_actions.shape == (2, 3, dim_action)
+
+@pytest.mark.parametrize('use_perception_film', [True, False])
+@pytest.mark.parametrize('episodic_mem_len', [0, 4])
+def test_world_model_ttt(use_perception_film, episodic_mem_len):
+    dim = 256
+
+    # transformer
+
+    model = Transformer(
+        dim = dim,
+        depth = 2,
+        causal = True
+    )
+
+    # world model
+
+    wm = WorldModel(
+        model = model,
+        state_encoder = nn.Linear(32, dim),
+        action_encoder = nn.Linear(8, dim),
+        dim_action = 8,
+        transition_action_space = 'raw',
+        continuous_actions = True,
+        use_perception_film = use_perception_film,
+        episodic_mem_len = episodic_mem_len
+    )
+
+    # ttt meta learning loss
+
+    ttt_loss = TTTMetaLearningLoss(
+        dim = dim,
+        num_classes = 64,
+        depth = 1,
+        heads = 4
+    )
+
+    # wrap with rollout wrapper
+
+    # targeting the first Linear projection of the feedforward block in the first transformer layer
+    ttt_module_paths = ('model.layers.0.2.1',)
+
+    wrapper = WorldModelRolloutWrapper(
+        world_model = wm,
+        chunk_size = 16,
+        tbptt_steps = 2,
+        ttt_module_paths = ttt_module_paths,
+        ttt_loss_module = ttt_loss,
+        ttt_update_perception_film = use_perception_film,
+        ttt_lr = 1e-3
+    )
+
+    # simulate rollout
+
+    batch_size = 2
+
+    # step 1
+
+    states_step1 = torch.randn(batch_size, 1, 32)
+    actions_step1 = torch.randn(batch_size, 1, 8)
+
+    out1, memories = wrapper(states_step1, actions_step1, return_memories = True, return_loss = True)
+
+    # ensure ttt params initialized
+
+    check_module_name = 'perception_film' if use_perception_film else 'model.layers.0.2.1'
+    ttt_wrapper = wrapper.ttt_trainer.ttt_wrappers[check_module_name]
+    assert exists(ttt_wrapper.batch_params)
+
+    # step 2
+
+    states_step2 = torch.randn(batch_size, 1, 32)
+    actions_step2 = torch.randn(batch_size, 1, 8)
+
+    # save params for comparison
+
+    params_before_step2 = {k: v.clone() for k, v in ttt_wrapper.batch_params.items()}
+
+    out2, memories = wrapper(states_step2, actions_step2, memories = memories, return_memories = True, return_loss = True)
+
+    # ensure ttt params updated
+
+    params_after_step2 = ttt_wrapper.batch_params
+
+    updated = False
+    for k in params_before_step2.keys():
+        if not torch.allclose(params_before_step2[k], params_after_step2[k]):
+            updated = True
+            break
+
+    assert updated

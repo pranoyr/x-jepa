@@ -1,8 +1,11 @@
 from __future__ import annotations
 from typing import Callable, Literal
 
+import math
 import inspect
-from functools import partial
+from random import random
+from contextlib import nullcontext
+from functools import partial, reduce as ft_reduce
 from collections import namedtuple
 
 import torch
@@ -13,8 +16,9 @@ import einx
 from torch import nn, cat, stack, tensor, is_tensor, Tensor
 from torch.nn import Module, ModuleList, ModuleDict, Linear, RMSNorm, Sequential
 from torch.utils._pytree import tree_map
+from torch.func import functional_call, vmap
 
-from einops import einsum, rearrange, repeat, reduce
+from einops import einsum, rearrange, repeat, reduce, pack, unpack
 from einops.layers.torch import Rearrange
 
 from ema_pytorch import EMA
@@ -23,13 +27,15 @@ from assoc_scan import AssocScan
 from x_mlps_pytorch import MLP
 
 from torch_einops_utils import (
+    masked_mean,
     pad_right_at_dim_to,
     temp_eval,
     batched_index_select,
     tree_map_tensor,
     pack_with_inverse,
     lens_to_mask,
-    maybe
+    maybe,
+    safe_cat
 )
 
 from PoPE_pytorch import PoPE, apply_pope_to_qk
@@ -38,6 +44,7 @@ from x_jepa.utils import EnvWrapper, Experience
 
 from x_jepa.regularizers import SigReg, uniform_wasserstein_loss, temporal_straightening_loss
 from x_jepa.min_gru import minGRUBlocks
+from x_jepa.goals import GoalGenerator, FlowMatching
 
 # constants
 
@@ -111,6 +118,9 @@ def safe_divide(num, den, eps = 1e-5):
 
     return num / den.clamp(min = eps)
 
+def divisible_by(numer, denom):
+    return (numer % denom) == 0
+
 def l1norm(t, dim = -1):
     return F.normalize(t, p = 1, dim = dim)
 
@@ -120,14 +130,42 @@ def batch_repeat(t, r):
 def tree_map_tensor_to_device(tree, device):
     return tree_map_tensor(lambda t: t.to(device), tree)
 
-def tree_map_detach(tree):
-    return tree_map_tensor(lambda t: t.detach(), tree)
+def detach_tensor(t, *, preserve_requires_grad = False):
+    orig_requires_grad = t.require_grad
+    out = t.detach()
+
+    if not preserve_requires_grad:
+        return out
+
+    return out.requires_grad_(orig_requires_grad)
+
+def tree_map_detach(tree, **kwargs):
+    return tree_map_tensor(lambda t: detach_tensor(t, **kwargs), tree)
 
 def max_neg_value(t):
     return -torch.finfo(t.dtype).max
 
 def SmallInitEmbed(shape, eps = 0.02):
     return nn.Parameter(torch.randn(shape) * eps)
+
+def get_module_by_path(model, path):
+    return ft_reduce(getattr, path.split('.'), model)
+
+def set_module_by_path(model, path, new_mod):
+    *parts, last = path.split('.')
+    mod = ft_reduce(getattr, parts, model)
+    setattr(mod, last, new_mod)
+
+# film, for perception gating for starters, but eventually will be used for configurator modulation in the jepa diagram
+
+class FiLM(Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(dim))
+        self.beta = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x):
+        return x * self.gamma + self.beta
 
 # helper modules
 
@@ -251,7 +289,7 @@ class AttentionResidual(Module):
 
         hiddens, unpack = pack_with_inverse(hiddens, 'l * d')
 
-        last_layer_output = hiddens[-1]
+        *_, last_layer_output = hiddens
 
         # cross attention
 
@@ -298,6 +336,25 @@ def SwiGLUFeedForward(
         Linear(dim_inner, dim)
     )
 
+# episodic memories
+
+class EpisodicMemories(Module):
+    def __init__(
+        self,
+        depth,
+        heads,
+        seq_len,
+        dim_head
+    ):
+        super().__init__()
+        self.mem_kv = nn.Parameter(torch.randn(2, depth, heads, seq_len, dim_head))
+        nn.init.normal_(self.mem_kv, std = 0.02)
+
+    def forward(self, batch_size):
+        mem_kv = repeat(self.mem_kv, '... -> b ...', b = batch_size)
+        mem_k, mem_v = mem_kv.unbind(dim = 1)
+        return [(k, v) for k, v in zip(mem_k.unbind(dim = 1), mem_v.unbind(dim = 1))]
+
 # transformer
 
 class Transformer(Module):
@@ -314,6 +371,9 @@ class Transformer(Module):
     ):
         super().__init__()
         self.dim = dim
+        self.depth = depth
+        self.heads = heads
+        self.dim_head = dim_head
 
         self.pope = PoPE(dim_head, heads = heads) if use_pope else None
 
@@ -335,6 +395,7 @@ class Transformer(Module):
         past_layers_mask = None,
         return_hiddens = False,
         memories = None,
+        prepend_memories = None,
         return_memories = False
     ):
         seq_len = tokens.shape[-2]
@@ -353,9 +414,14 @@ class Transformer(Module):
         next_layer_memories = []
 
         memories_iter = iter(layer_memories) if exists(layer_memories) else None
+        prepend_memories_iter = iter(prepend_memories) if exists(prepend_memories) else None
 
         for attn_res, attn, ff in self.layers:
             layer_memory = next(memories_iter, None) if exists(memories_iter) else None
+
+            if exists(prepend_memories_iter):
+                prep_memory = next(prepend_memories_iter)
+                layer_memory = tuple(safe_cat((p, m), dim = -2) for p, m in zip(prep_memory, layer_memory or (None, None)))
 
             attn_out, next_memory = attn(
                 tokens,
@@ -831,6 +897,7 @@ class WorldModel(Module):
         reg_loss_kwargs: dict | None = None,
         state_linear_rnn_depth = 1,
         action_linear_rnn_depth = 1,
+        use_perception_film = False,
         num_sensory_views: tuple[int, ...] | None = None,
         cross_sensory_align_pairs: list[tuple[int, int]] | None = None,
         cross_sensory_align_loss_weight: float = 1.,
@@ -838,7 +905,7 @@ class WorldModel(Module):
         intrinsics: Module | list[Module] | ModuleList | tuple[Module, ...] | None = None,
         intrinsic_loss_weight: float = 1.,
         intrinsic_frac_gradient: float | tuple[float, ...] | list[float] = 0.,
-        sigreg_loss_weight: float | None = None
+        episodic_mem_len = 0
     ):
         super().__init__()
 
@@ -855,6 +922,15 @@ class WorldModel(Module):
         self.state_latent_clamp_value = state_latent_clamp_value
         self.has_state_latent_clamp = state_latent_clamp_value > 0.
 
+        self.has_episodic_mem = episodic_mem_len > 0
+        if self.has_episodic_mem:
+            self.episodic_mems = EpisodicMemories(
+                depth = model.depth,
+                heads = model.heads,
+                seq_len = episodic_mem_len,
+                dim_head = model.dim_head
+            )
+
         # handle state encoders
         # which could have multiple states, and each could have multiple views (ie. eyes, ears)
 
@@ -870,6 +946,12 @@ class WorldModel(Module):
         self.num_sensory_views = num_sensory_views
 
         self.view_embs = nn.ParameterList([SmallInitEmbed((v, dim)) if v > 1 else None for v in self.num_sensory_views])
+
+        self.use_perception_film = use_perception_film
+        if use_perception_film:
+            self.perception_film = FiLM(dim)
+
+        self.only_ttt_updateable_params = ('perception_film',) if use_perception_film else tuple()
 
         if pass_sensory_hiddens_to_world_model:
             assert len(self.state_encoder) > 1, 'passing sensory layers to attention residual requires more than one modality'
@@ -1058,8 +1140,7 @@ class WorldModel(Module):
         self.learn_goal_generator = learn_goal_generator
         self.goal_loss_weight = goal_loss_weight
 
-        if learn_goal_generator:
-            from x_jepa.goals import GoalGenerator, FlowMatching
+        if self.learn_goal_generator:
             self.goal_generator = GoalGenerator(
                 dim = dim_state_latent,
                 returns_norm_momentum = returns_norm_momentum # controls how fast the agent ascends the hedonic treadmill
@@ -1103,6 +1184,12 @@ class WorldModel(Module):
     @property
     def device(self):
         return self.zero.device
+
+    def parameters(self, recurse = True):
+        for name, param in self.named_parameters(recurse = recurse):
+            if any(keyword in name for keyword in self.only_ttt_updateable_params):
+                continue
+            yield param
 
     def encode_states(
         self,
@@ -1232,10 +1319,15 @@ class WorldModel(Module):
 
         tokens = rearrange([rnn_state_tokens, rnn_action_tokens], 'sa b n d -> b (n sa) d')
 
+        prepend_memories = None
+        if self.has_episodic_mem and not exists(model_memories):
+            prepend_memories = self.episodic_mems(batch)
+
         (embeds, _), next_model_memories = self.ema_model(
             tokens,
             return_hiddens = True,
             memories = model_memories,
+            prepend_memories = prepend_memories,
             return_memories = True
         )
 
@@ -1454,7 +1546,7 @@ class WorldModel(Module):
                 fitnesses = fitness_fn(**fitness_fn_kwargs)
             else:
                 goal_dist_fn = default(goal_dist_fn, partial(F.smooth_l1_loss, reduction = 'none'))
-                distance_to_goal = goal_dist_fn(pred_next_encoded_states, encoded_goal)
+                distance_to_goal = goal_dist_fn(pred_next_encoded_states, encoded_goal.expand_as(pred_next_encoded_states))
                 distance_to_goal = reduce(distance_to_goal, 'b p h d -> b p', 'sum')
                 fitnesses = -distance_to_goal
 
@@ -1683,6 +1775,12 @@ class WorldModel(Module):
         # encode the states and actions, todo: do mixture of transformers, a la VLAs
 
         state_tokens, sensory_layer_hiddens, sensory_for_alignment = self.encode_states(self.state_encoder, states)
+
+        # perceptual gating
+
+        if self.use_perception_film:
+            state_tokens = self.perception_film(state_tokens)
+
         action_tokens = self.action_encoder(actions)
 
         # linear rnns for contextualizing states and actions separately, and for potential path integration and idm
@@ -1773,16 +1871,24 @@ class WorldModel(Module):
 
         # we will follow Teoh et al's lead and use the post-norm space as the latent
 
+        prepend_memories = None
+        if self.has_episodic_mem and not exists(model_memories):
+            prepend_memories = self.episodic_mems(batch)
+
         (embeds, world_model_hiddens), next_model_memories = self.model(
             tokens,
             past_layers = wm_past_layers,
             past_layers_mask = wm_past_layers_mask,
             return_hiddens = True,
             memories = model_memories,
+            prepend_memories = prepend_memories,
             return_memories = True
         )
 
-        target_embeds = self.ema_model(tokens)
+        target_embeds = self.ema_model(
+            tokens,
+            prepend_memories = prepend_memories
+        )
 
         # split out the state and action embeds
 
@@ -1978,19 +2084,19 @@ class WorldModel(Module):
 
         # temporal straightening loss
 
-        temporal_straightening_loss = self.zero
+        temporal_straightening_loss_val = self.zero
 
         if self.has_temporal_straightening_loss:
-            temporal_straightening_loss = temporal_straightening_loss(state_latents_full)
+            temporal_straightening_loss_val = temporal_straightening_loss(state_latents_full)
 
         # goal generator loss
 
         goal_loss = self.zero
 
-        if self.learn_goal_generator and exists(returns):
+        if self.learn_goal_generator and exists(returns_tensor):
             flat_state_latents = rearrange(state_latents_full.detach(), '... d -> (...) d')
 
-            flat_returns = rearrange(returns, '... -> (...)')
+            flat_returns = rearrange(returns_tensor, '... -> (...)')
 
             goal_loss = self.goal_flow_matching(flat_state_latents, returns = flat_returns)
 
@@ -2025,7 +2131,7 @@ class WorldModel(Module):
             reg_next_encoded_loss,
             action_latent_wasserstein_loss,
             goal_loss,
-            temporal_straightening_loss,
+            temporal_straightening_loss_val,
             align_pre_state_action_repr_loss,
             align_pre_state_action_repr_sigreg_loss,
             cross_sensory_align_loss,
@@ -2046,7 +2152,7 @@ class WorldModel(Module):
             reg_next_encoded_loss * self.reg_next_encoded_weight +
             action_latent_wasserstein_loss * self.action_latent_wasserstein_loss_weight +
             goal_loss * self.goal_loss_weight +
-            temporal_straightening_loss * self.temporal_straightening_loss_weight +
+            temporal_straightening_loss_val * self.temporal_straightening_loss_weight +
             align_pre_state_action_repr_loss * self.align_pre_state_action_repr_loss_weight +
             align_pre_state_action_repr_sigreg_loss * self.align_pre_state_action_repr_sigreg_weight +
             cross_sensory_align_loss * self.cross_sensory_align_loss_weight +
@@ -2056,3 +2162,299 @@ class WorldModel(Module):
 
         out = (total_loss, loss_breakdown)
         return (out, next_memories) if return_memories else out
+
+# test-time training
+
+class TTTModuleWrapper(Module):
+    def __init__(self, module: Module):
+        super().__init__()
+        self.module = module
+        self.batch_params = None
+
+    def forward(self, *args, **kwargs):
+        if not exists(self.batch_params):
+            return self.module(*args, **kwargs)
+
+        def call_single(params, *args_single):
+            return functional_call(self.module, params, args_single, kwargs)
+
+        return vmap(call_single)(self.batch_params, *args)
+
+class TTTMetaLearningLoss(Module):
+    def __init__(
+        self,
+        *,
+        dim,
+        num_classes,
+        depth = 1,
+        heads = 4,
+        dim_head = 64
+    ):
+        super().__init__()
+        self.encoder = Transformer(
+            dim = dim,
+            depth = depth,
+            heads = heads,
+            dim_head = dim_head,
+            causal = False
+        )
+
+        self.to_prediction = nn.Sequential(
+            RMSNorm(dim),
+            LinearNoBias(dim, num_classes)
+        )
+        self.to_meta_prediction = nn.Sequential(
+            RMSNorm(dim),
+            LinearNoBias(dim, num_classes)
+        )
+
+    def forward(self, hiddens, mask = None):
+        pred = self.to_prediction(hiddens)
+
+        encoded = self.encoder(hiddens)
+        meta_pred = self.to_meta_prediction(encoded)
+
+        prob_earlier = pred.softmax(dim = -1)
+        log_prob_encoded = meta_pred.log_softmax(dim = -1)
+
+        loss = F.kl_div(log_prob_encoded, prob_earlier, reduction = 'none').sum(dim = -1)
+        return masked_mean(loss, mask)
+
+class TestTimeTrainer(Module):
+    def __init__(
+        self,
+        model: Module,
+        ttt_module_paths: tuple[str, ...],
+        ttt_loss_module: Module,
+        ttt_lr = 1e-3,
+        ttt_wd = 0.01
+    ):
+        super().__init__()
+        self.model = model
+        self.ttt_module_paths = ttt_module_paths
+        self.ttt_lr = ttt_lr
+        self.ttt_wd = ttt_wd
+
+        self.ttt_loss_module = ttt_loss_module
+        self.ttt_wrappers = dict()
+
+        for path in self.ttt_module_paths:
+            if path in self.ttt_wrappers:
+                continue
+
+            mod = get_module_by_path(model, path)
+            wrapper = TTTModuleWrapper(mod)
+            set_module_by_path(model, path, wrapper)
+            self.ttt_wrappers[path] = wrapper
+
+    @property
+    def has_ttt(self):
+        return len(self.ttt_wrappers) > 0
+
+    def init_ttt(self, batch):
+        if not self.has_ttt:
+            return
+
+        for wrapper in self.ttt_wrappers.values():
+            wrapper.batch_params = tree_map_tensor(
+                lambda t: repeat(t, '... -> b ...', b = batch),
+                dict(wrapper.module.named_parameters())
+            )
+
+    def detach_params(self):
+        if not self.has_ttt:
+            return
+
+        for wrapper in self.ttt_wrappers.values():
+            wrapper.batch_params = tree_map_detach(
+                wrapper.batch_params,
+                preserve_requires_grad = True
+            )
+
+    def update(
+        self,
+        hiddens,
+        mask = None,
+        create_graph = False
+    ):
+        if not self.has_ttt:
+            return
+
+        loss_t_per_batch = self.ttt_loss_module(hiddens, mask = mask)
+
+        all_batch_params = [
+            param
+            for path in self.ttt_module_paths
+            for param in self.ttt_wrappers[path].batch_params.values()
+        ]
+
+        grads = torch.autograd.grad(
+            loss_t_per_batch.sum(),
+            all_batch_params,
+            create_graph = create_graph,
+            retain_graph = create_graph,
+            allow_unused = True
+        )
+
+        # update parameters with gradients
+
+        grads_iter = iter(grads)
+
+        for path in self.ttt_module_paths:
+            wrapper = self.ttt_wrappers[path]
+
+            new_batch_params = dict()
+            for tgt_name, tgt_param in wrapper.batch_params.items():
+                grad = next(grads_iter)
+                if exists(grad):
+                    grad_update = self.ttt_lr * grad
+                    wd_update = self.ttt_lr * self.ttt_wd * tgt_param
+                    tgt_param = tgt_param - grad_update - wd_update
+
+                if not create_graph:
+                    tgt_param = tgt_param.detach().requires_grad_()
+
+                new_batch_params[tgt_name] = tgt_param
+
+            wrapper.batch_params = new_batch_params
+
+# rollout wrapper for chunking and test-time training
+
+class WorldModelRolloutWrapper(Module):
+    def __init__(
+        self,
+        world_model: Module,
+        chunk_size = 128,
+        tbptt_steps = 2,
+        ttt_module_paths: tuple[str, ...] = tuple(),
+        ttt_update_perception_film = False,
+        ttt_lr = 1e-3,
+        ttt_wd = 0.01,
+        ttt_loss_module: Module | None = None
+    ):
+        super().__init__()
+        self.world_model = world_model
+        self.chunk_size = chunk_size
+        self.tbptt_steps = tbptt_steps
+
+        # append perception film to ttt paths if enabled
+
+        if ttt_update_perception_film:
+            assert world_model.use_perception_film, 'WorldModel must have use_perception_film=True to update it via TTT'
+            ttt_module_paths = (*ttt_module_paths, 'perception_film')
+
+        self.has_ttt = len(ttt_module_paths) > 0
+        self.ttt_trainer = None
+
+        if self.has_ttt:
+            assert exists(ttt_loss_module), 'ttt_loss_module must be provided if ttt_module_paths is provided'
+            self.ttt_trainer = TestTimeTrainer(
+                model = world_model,
+                ttt_module_paths = ttt_module_paths,
+                ttt_loss_module = ttt_loss_module,
+                ttt_lr = ttt_lr,
+                ttt_wd = ttt_wd
+            )
+            assert tbptt_steps > 1, 'tbptt_steps must be greater than 1 if ttt is turned on'
+
+        # hook to capture hiddens during ttt
+
+        self._captured_hiddens = None
+        if self.has_ttt:
+            def hook(module, args, kwargs, output):
+                output_tokens, layer_hiddens = output[0]
+                *_, last_layer_hidden = layer_hiddens
+                self._captured_hiddens = last_layer_hidden
+
+            self.world_model.model.register_forward_hook(hook, with_kwargs = True)
+
+    def forward(
+        self,
+        states,
+        actions = None,
+        returns = None,
+        memories = None,
+        return_memories = False,
+        behavior_clone = True,
+        return_loss = True
+    ):
+        state_tensor = first_tensor(states)
+        batch, seq_len = state_tensor.shape[:2]
+
+        # auto-initialize ttt if starting a new sequence
+
+        if self.has_ttt and not exists(memories):
+            self.ttt_trainer.init_ttt(batch)
+
+        # iterate over chunks
+
+        num_chunks = math.ceil(seq_len / self.chunk_size)
+        total_loss_accum = 0.
+        last_loss_breakdown = None
+        out_embeds = []
+
+        forward_context = torch.enable_grad if self.has_ttt else nullcontext
+
+        with forward_context():
+            for idx in range(num_chunks):
+                is_last_chunk = (idx == num_chunks - 1)
+                should_detach = divisible_by(idx + 1, self.tbptt_steps)
+
+                # fetch chunk inputs
+
+                start, end = idx * self.chunk_size, (idx + 1) * self.chunk_size
+
+                def get_chunk(t):
+                    return t[:, start:end] if is_tensor(t) and t.ndim > 1 else t
+
+                tree_map_get_chunk = maybe(partial(tree_map, get_chunk))
+
+                chunk_states = tree_map(get_chunk, states)
+                chunk_actions = tree_map_get_chunk(actions)
+                chunk_returns = tree_map_get_chunk(returns)
+
+                chunk_len = first_tensor(chunk_states).shape[1]
+                loss_weight = chunk_len / seq_len
+
+                # forward world model
+
+                wm_out = self.world_model(
+                    states = chunk_states,
+                    actions = chunk_actions,
+                    returns = chunk_returns,
+                    memories = memories,
+                    return_memories = True,
+                    behavior_clone = behavior_clone,
+                    return_loss = return_loss
+                )
+
+                if return_loss:
+                    chunk_out, next_memories = wm_out
+                    chunk_total_loss, chunk_breakdown = chunk_out
+                    total_loss_accum = total_loss_accum + chunk_total_loss * loss_weight
+                    last_loss_breakdown = chunk_breakdown
+                else:
+                    out, next_memories = wm_out
+                    out_embeds.append(out['embeds'])
+
+                # ttt update
+
+                skip_ttt_update = is_last_chunk and not return_memories
+
+                if self.has_ttt and not skip_ttt_update and exists(self._captured_hiddens):
+                    self.ttt_trainer.update(
+                        hiddens = self._captured_hiddens,
+                        create_graph = self.training
+                    )
+                    self._captured_hiddens = None
+
+                memories = next_memories
+
+                if should_detach:
+                    if self.has_ttt:
+                        self.ttt_trainer.detach_params()
+
+                    memories = tree_map_detach(memories)
+
+        out = (total_loss_accum, last_loss_breakdown) if return_loss else dict(embeds = cat(out_embeds, dim = 1))
+        return (out, memories) if return_memories else out
