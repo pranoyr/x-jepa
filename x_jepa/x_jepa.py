@@ -36,7 +36,10 @@ from torch_einops_utils import (
     pack_with_inverse,
     lens_to_mask,
     maybe,
-    safe_cat
+    safe_cat,
+    detach_tensor,
+    tree_map_detach,
+    tree_map_tensor_to_device
 )
 
 from PoPE_pytorch import PoPE, apply_pope_to_qk
@@ -127,21 +130,6 @@ def l1norm(t, dim = -1):
 
 def batch_repeat(t, r):
     return repeat(t, 'b ... -> (b r) ...', r = r)
-
-def tree_map_tensor_to_device(tree, device):
-    return tree_map_tensor(lambda t: t.to(device), tree)
-
-def detach_tensor(t, *, preserve_requires_grad = False):
-    orig_requires_grad = t.requires_grad
-    out = t.detach()
-
-    if not preserve_requires_grad:
-        return out
-
-    return out.requires_grad_(orig_requires_grad)
-
-def tree_map_detach(tree, **kwargs):
-    return tree_map_tensor(lambda t: detach_tensor(t, **kwargs), tree)
 
 def max_neg_value(t):
     return -torch.finfo(t.dtype).max
