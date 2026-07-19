@@ -1957,7 +1957,7 @@ class WorldModel(Module):
                 tgt_align_tokens = sensory_for_alignment[tgt_idx]
 
                 pred_tgt = predictor(src_align_tokens)
-                pair_loss = F.mse_loss(pred_tgt, tgt_align_tokens)
+                pair_loss = F.mse_loss(pred_tgt, tgt_align_tokens.detach())
 
                 cross_sensory_align_loss = cross_sensory_align_loss + pair_loss
                 pair_losses.append(CrossSensoryPairLoss(src_idx, tgt_idx, pair_loss))
